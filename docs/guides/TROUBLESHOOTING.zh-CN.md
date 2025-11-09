@@ -119,6 +119,50 @@ cat decision_logs/your_trader_id/$(ls -t decision_logs/your_trader_id/ | head -1
 
 ---
 
+#### ❌ 决策验证失败：`新止盈价格必须大于0`
+
+**症状:** 前端提示“获取 AI 决策失败… 决策 #2 验证失败: 新止盈价格必须大于0: 0.00”，对应的 `decision_logs/decision_*.json` 中 `success` 为 `false`。
+
+**根本原因:** 动态调整止盈（`update_take_profit`）动作的参数校验失败。后端在 `decision/engine.go` 中要求 `new_take_profit` 必须是正数；如果模型输出为 `0` 或缺失该字段，就会触发此错误。我们已经在解析阶段做了兼容，会把旧模板里的 `take_profit` 拷贝到 `new_take_profit`，因此只有在 AI 真正给出非法值时才会看到本提示。【F:decision/engine.go†L101-L114】【F:decision/engine.go†L790-L814】
+
+**解决方案:**
+1. 检查对应日志文件的 `decision_json` 字段，确认模型生成的 `take_profit` 值是否合理。
+2. 调整提示词或推理逻辑，确保在执行 `update_take_profit` 时提供一个有效的正数（现货做多应大于当前价格，做空应低于当前价格但仍需大于 0）。
+3. 若暂时不需要调整止盈，可让模型改为返回 `hold` 或忽略该动作，待参数正确时再发出修改指令。
+
+**提示:** 如果你通过 Hook 或中间件修改了决策数据，也要确保不会把 `new_take_profit` 重写为 `0` 或空值。
+
+---
+
+#### 🔁 如何清除自定义 Prompt 并进行“干净部署”
+
+**背景:** 自定义交易策略 Prompt、是否覆盖基础 Prompt 以及系统 Prompt 模板等信息都会写入 `config.db` 内的 `traders` 表字段 `custom_prompt`、`override_base_prompt`、`system_prompt_template` 中。即使你替换了程序镜像或重新拉取代码，只要 `config.db` 保留，旧的 Prompt 仍会被加载。【F:config/database.go†L247-L265】【F:config/database.go†L953-L972】
+
+**场景 1 — 完全清空历史配置（含 Prompt、API Key 等）:**
+
+1. 停止正在运行的进程或容器，例如 `pm2 stop all`、`docker compose down`。
+2. 备份再删除旧数据库：`cp config.db config.db.bak && rm config.db`。
+3. 重新执行 `start.sh`（或容器启动脚本）。程序会新建空白数据库，并再次把 `config.json` 同步进去，等同“干净部署”。【F:main.go†L163-L195】
+
+**场景 2 — 仅重置 Prompt，保留其它配置:**
+
+1. 同样先停止服务，避免写入冲突。
+2. 在项目根目录执行：
+   ```bash
+   sqlite3 config.db <<'SQL'
+   UPDATE traders
+   SET custom_prompt = '',
+       override_base_prompt = 0,
+       system_prompt_template = 'default';
+   .quit
+   SQL
+   ```
+3. 重新启动服务。之后所有交易员都会回到默认 Prompt 设置；若有需要，可再通过管理后台或 API 重新填写自定义 Prompt。
+
+> ✅ 小贴士：如果你使用 Docker 部署，请在容器内执行上述命令，或使用 `docker compose exec trader sh` 进入容器后再运行。
+
+---
+
 #### ❌ AI 做出错误决策
 
 **请记住:** AI 交易是实验性的，不保证盈利。

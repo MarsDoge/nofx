@@ -37,7 +37,7 @@ type PositionInfo struct {
 	Leverage         int     `json:"leverage"`
 	UnrealizedPnL    float64 `json:"unrealized_pnl"`
 	UnrealizedPnLPct float64 `json:"unrealized_pnl_pct"`
-	PeakPnLPct       float64 `json:"peak_pnl_pct"`       // 历史最高收益率（百分比）
+	PeakPnLPct       float64 `json:"peak_pnl_pct"` // 历史最高收益率（百分比）
 	LiquidationPrice float64 `json:"liquidation_price"`
 	MarginUsed       float64 `json:"margin_used"`
 	UpdateTime       int64   `json:"update_time"` // 持仓更新时间戳（毫秒）
@@ -97,8 +97,12 @@ type Decision struct {
 	TakeProfit      float64 `json:"take_profit,omitempty"`
 
 	// 调整参数（新增）
-	NewStopLoss     float64 `json:"new_stop_loss,omitempty"`    // 用于 update_stop_loss
-	NewTakeProfit   float64 `json:"new_take_profit,omitempty"`  // 用于 update_take_profit
+    // 约定：AI 在执行 update_* 动作时应填写 new_* 字段。
+    // 但在引入该约定（2025-11-04，commit a486859）之前，默认模板 prompts/default.txt
+    // 以及基于它定制的部署仍仅输出 stop_loss / take_profit。本地校验又只读取 new_*
+    // 字段，所以这里保留两个字段，并在解析阶段做兼容处理，避免把有效值当成 0。
+	NewStopLoss     float64 `json:"new_stop_loss,omitempty"`    // 用于 update_stop_loss（未提供时回退到 stop_loss）
+	NewTakeProfit   float64 `json:"new_take_profit,omitempty"`  // 用于 update_take_profit（未提供时回退到 take_profit）
 	ClosePercentage float64 `json:"close_percentage,omitempty"` // 用于 partial_close (0-100)
 
 	// 通用参数
@@ -532,6 +536,7 @@ func extractDecisions(response string) ([]Decision, error) {
 		if err := json.Unmarshal([]byte(jsonContent), &decisions); err != nil {
 			return nil, fmt.Errorf("JSON解析失败: %w\nJSON内容: %s", err, jsonContent)
 		}
+		normalizeDecisionFields(decisions)
 		return decisions, nil
 	}
 
@@ -573,7 +578,26 @@ func extractDecisions(response string) ([]Decision, error) {
 		return nil, fmt.Errorf("JSON解析失败: %w\nJSON内容: %s", err, jsonContent)
 	}
 
+	normalizeDecisionFields(decisions)
 	return decisions, nil
+}
+
+// normalizeDecisionFields 兼容旧字段名，避免 update_* 决策因为缺少 new_* 字段而被判定为 0
+func normalizeDecisionFields(decisions []Decision) {
+	for i := range decisions {
+		d := &decisions[i]
+
+		switch d.Action {
+		case "update_stop_loss":
+			if d.NewStopLoss <= 0 && d.StopLoss > 0 {
+				d.NewStopLoss = d.StopLoss
+			}
+		case "update_take_profit":
+			if d.NewTakeProfit <= 0 && d.TakeProfit > 0 {
+				d.NewTakeProfit = d.TakeProfit
+			}
+		}
+	}
 }
 
 // fixMissingQuotes 替换中文引号和全角字符为英文引号和半角字符（避免AI输出全角JSON字符导致解析失败）
