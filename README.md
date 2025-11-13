@@ -1251,6 +1251,25 @@ sudo apt-get install libta-lib0-dev
 - If API fails, system uses default mainstream coins (BTC, ETH, etc.)
 - ~~Check API URL and auth parameter in config.json~~ *Check configuration in web interface*
 
+### 6. WebSocket can't connect when using an HTTP/HTTPS proxy
+
+**Solution**:
+- Export standard proxy environment variables *before* starting the backend:
+  ```bash
+  export HTTPS_PROXY=http://<proxy-host>:<port>
+  export HTTP_PROXY=http://<proxy-host>:<port>
+
+  # If your proxy requires credentials
+  export HTTPS_PROXY=http://user:pass@<proxy-host>:<port>
+  export HTTP_PROXY=http://user:pass@<proxy-host>:<port>
+
+  # Start NOFX normally
+  ./start.sh
+  ```
+- **Docker Compose**: put the variables in `.env` or the service's `environment` block.
+- **PM2 / systemd**: export the variables in the service definition before executing the binary.
+- NOFX relies on Go's `http.ProxyFromEnvironment`, so every outbound request—including the Binance combined streams WebSocket—follows these proxy settings automatically when the variables are present.
+
 ---
 
 ## 📈 Performance Optimization Tips
