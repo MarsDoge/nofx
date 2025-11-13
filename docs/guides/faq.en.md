@@ -40,6 +40,26 @@ No! NOFX has a web UI for all configuration. However, basic command line knowled
 ### Should I use a subaccount?
 **Recommended**: Yes, use a subaccount dedicated to NOFX for better risk isolation. However, note that some subaccounts have restrictions (e.g., 5x max leverage on Binance).
 
+### How do I run NOFX behind an HTTP/HTTPS proxy?
+Export standard proxy environment variables **before** starting the backend so the Binance combined streams WebSocket can dial through your proxy:
+
+```bash
+export HTTPS_PROXY=http://<proxy-host>:<proxy-port>
+export HTTP_PROXY=http://<proxy-host>:<proxy-port>
+
+# If your proxy requires authentication
+export HTTPS_PROXY=http://username:password@<proxy-host>:<proxy-port>
+export HTTP_PROXY=http://username:password@<proxy-host>:<proxy-port>
+
+# Launch NOFX as usual
+./start.sh
+```
+
+- **Docker Compose:** add the variables in your `.env` file or the service `environment` block.
+- **PM2 / Systemd:** ensure the service definition exports the proxy variables before launching the binary.
+
+Once set, NOFX relies on Go's `http.ProxyFromEnvironment`, so all outbound requests (including the WebSocket) automatically respect the proxy configuration.
+
 ---
 
 ## Trading Questions

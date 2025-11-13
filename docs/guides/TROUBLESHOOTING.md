@@ -161,36 +161,6 @@ Access to Docker Hub is restricted or extremely slow in mainland China.
 
 ---
 
-#### ❌ Combined Streams WebSocket Timeout Behind a Proxy / Firewall
-
-**Error:** `dial tcp fstream.binance.com:443: i/o timeout`
-
-**Root Cause:** The Binance Futures combined stream uses a WebSocket connection. If
-your network must go through an HTTP/HTTPS proxy, the outbound request will
-time out unless the process inherits the proxy configuration.
-
-**Solution:** Export standard proxy environment variables before starting the
-backend (available since commit `6cdf73b9`):
-
-```bash
-export HTTPS_PROXY=http://<proxy-host>:<proxy-port>
-export HTTP_PROXY=http://<proxy-host>:<proxy-port>
-
-# If your proxy requires authentication
-export HTTPS_PROXY=http://username:password@<proxy-host>:<proxy-port>
-export HTTP_PROXY=http://username:password@<proxy-host>:<proxy-port>
-
-# Then start nofx as usual
-./start.sh
-```
-
-- **Docker Compose:** add the variables to your `.env` file or service
-  `environment` section.
-- **PM2 / Systemd:** ensure the service definition exports the proxy variables
-  before launching the binary.
-
-Once the variables are set, the WebSocket dialer automatically picks them up via
-`http.ProxyFromEnvironment` and the combined stream should connect successfully.
    # Settings → Docker Engine
    ```
 
