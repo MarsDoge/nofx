@@ -40,6 +40,26 @@ AI 交易是**实验性**的，**不保证盈利**。请始终用小额资金测
 ### 应该使用子账户吗？
 **推荐**：是的，使用专门的子账户运行 NOFX 可以更好地隔离风险。但请注意，某些子账户有限制（例如币安子账户最高 5 倍杠杆）。
 
+### 如何在 HTTP/HTTPS 代理环境下运行 NOFX？
+在启动后端之前导出标准代理环境变量，确保币安组合流 WebSocket 可以通过代理建立连接：
+
+```bash
+export HTTPS_PROXY=http://<代理主机>:<端口>
+export HTTP_PROXY=http://<代理主机>:<端口>
+
+# 如果代理需要账号密码
+export HTTPS_PROXY=http://用户名:密码@<代理主机>:<端口>
+export HTTP_PROXY=http://用户名:密码@<代理主机>:<端口>
+
+# 正常启动 NOFX
+./start.sh
+```
+
+- **Docker Compose：** 将变量写入 `.env` 或服务的 `environment` 配置。
+- **PM2 / Systemd：** 确保服务定义在启动可执行文件前导出代理变量。
+
+变量设置完成后，NOFX 使用 Go 的 `http.ProxyFromEnvironment`，包括 WebSocket 在内的所有出站请求都会自动遵循代理配置。
+
 ---
 
 ## 交易问题

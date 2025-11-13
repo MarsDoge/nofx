@@ -158,6 +158,9 @@ Access to Docker Hub is restricted or extremely slow in mainland China.
    sudo nano /etc/docker/daemon.json
 
    # macOS (Docker Desktop)
+
+---
+
    # Settings → Docker Engine
    ```
 

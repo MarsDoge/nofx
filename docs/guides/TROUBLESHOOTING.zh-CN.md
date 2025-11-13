@@ -158,6 +158,9 @@ cat decision_logs/your_trader_id/$(ls -t decision_logs/your_trader_id/ | head -1
    sudo nano /etc/docker/daemon.json
 
    # macOS (Docker Desktop)
+
+---
+
    # Settings → Docker Engine
    ```
 
