@@ -158,6 +158,36 @@ cat decision_logs/your_trader_id/$(ls -t decision_logs/your_trader_id/ | head -1
    sudo nano /etc/docker/daemon.json
 
    # macOS (Docker Desktop)
+
+---
+
+#### ❌ 组合流 WebSocket 在代理/防火墙环境下超时
+
+**错误:** `dial tcp fstream.binance.com:443: i/o timeout`
+
+**根本原因:** 币安合约组合流使用 WebSocket 连接。如果所在网络必须通过
+HTTP/HTTPS 代理访问外网，而进程没有继承代理配置，请求会直接超时。
+
+**解决方案:** 在启动后端之前导出标准代理环境变量（提交 `6cdf73b9`
+之后已支持）：
+
+```bash
+export HTTPS_PROXY=http://<代理主机>:<端口>
+export HTTP_PROXY=http://<代理主机>:<端口>
+
+# 如果代理需要账号密码
+export HTTPS_PROXY=http://用户名:密码@<代理主机>:<端口>
+export HTTP_PROXY=http://用户名:密码@<代理主机>:<端口>
+
+# 正常启动 nofx
+./start.sh
+```
+
+- **Docker Compose:** 将变量写入 `.env` 或服务的 `environment` 配置。
+- **PM2 / Systemd:** 确保服务定义在启动可执行文件前导出代理变量。
+
+变量设置完成后，WebSocket 拨号器会通过 `http.ProxyFromEnvironment`
+自动读取配置，组合流即可成功建立连接。
    # Settings → Docker Engine
    ```
 
