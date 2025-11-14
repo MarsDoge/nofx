@@ -93,6 +93,11 @@ type AutoTraderConfig struct {
 
 	// K线时间线配置
 	Timeframes []string // K线时间线选择，例如: ["1m", "15m", "1h", "4h"]
+
+	// Telegram 通知配置
+	EnableTelegramUpdates bool   // 是否启用 Telegram 推送
+	TelegramBotToken      string // Telegram Bot Token
+	TelegramChatID        int64  // Telegram Chat ID (支持群组，通常为负数)
 }
 
 // AutoTrader 自动交易器
@@ -136,6 +141,7 @@ type AutoTrader struct {
 	lastBalanceSyncTime   time.Time                        // 上次余额同步时间
 	database              interface{}                      // 数据库引用（用于自动更新余额）
 	userID                string                           // 用户ID
+	telegramSender        *logger.TelegramSender           // Telegram 推送发送器
 }
 
 // NewAutoTrader 创建自动交易器
@@ -241,6 +247,17 @@ func NewAutoTrader(config AutoTraderConfig, database interface{}, userID string)
 		systemPromptTemplate = "adaptive"
 	}
 
+	var telegramSender *logger.TelegramSender
+	if config.EnableTelegramUpdates && config.TelegramBotToken != "" && config.TelegramChatID != 0 {
+		sender, err := logger.NewTelegramSender(config.TelegramBotToken, config.TelegramChatID)
+		if err != nil {
+			log.Printf("⚠️ [%s] 初始化 Telegram 通知失败: %v", config.Name, err)
+		} else {
+			telegramSender = sender
+			log.Printf("📨 [%s] 已启用 Telegram 决策推送", config.Name)
+		}
+	}
+
 	return &AutoTrader{
 		id:                    config.ID,
 		name:                  config.Name,
@@ -277,6 +294,7 @@ func NewAutoTrader(config AutoTraderConfig, database interface{}, userID string)
 		userID:                userID,
 		coinPoolAPIURL:        strings.TrimSpace(config.CoinPoolAPIURL),
 		oiTopAPIURL:           strings.TrimSpace(config.OITopAPIURL),
+		telegramSender:        telegramSender,
 	}, nil
 }
 
@@ -330,12 +348,21 @@ func (at *AutoTrader) Stop() {
 	log.Println("⏹ 自动交易系统停止")
 }
 
+// Shutdown 释放自动交易器资源（在移除交易员或程序退出时调用）
+func (at *AutoTrader) Shutdown() {
+	if at.telegramSender != nil {
+		at.telegramSender.Stop()
+		at.telegramSender = nil
+	}
+}
+
 // runCycle 运行一个交易周期（使用AI全权决策）
 func (at *AutoTrader) runCycle() error {
 	at.callCount++
+	cycleStart := time.Now()
 
 	log.Print("\n" + strings.Repeat("=", 70) + "\n")
-	log.Printf("⏰ %s - AI决策周期 #%d", time.Now().Format("2006-01-02 15:04:05"), at.callCount)
+	log.Printf("⏰ %s - AI决策周期 #%d", cycleStart.Format("2006-01-02 15:04:05"), at.callCount)
 	log.Println(strings.Repeat("=", 70))
 
 	// 创建决策记录
@@ -351,7 +378,9 @@ func (at *AutoTrader) runCycle() error {
 		log.Printf("⏸ 风险控制：暂停交易中，剩余 %.0f 分钟", remaining.Minutes())
 		record.Success = false
 		record.ErrorMessage = fmt.Sprintf("风险控制暂停中，剩余 %.0f 分钟", remaining.Minutes())
-		at.decisionLogger.LogDecision(record)
+		if err := at.saveAndNotifyDecision(record, nil, cycleStart, time.Since(cycleStart)); err != nil {
+			log.Printf("⚠ 保存决策记录失败: %v", err)
+		}
 		return nil
 	}
 
@@ -363,7 +392,9 @@ func (at *AutoTrader) runCycle() error {
 	if err != nil {
 		record.Success = false
 		record.ErrorMessage = fmt.Sprintf("构建交易上下文失败: %v", err)
-		at.decisionLogger.LogDecision(record)
+		if saveErr := at.saveAndNotifyDecision(record, nil, cycleStart, time.Since(cycleStart)); saveErr != nil {
+			log.Printf("⚠ 保存决策记录失败: %v", saveErr)
+		}
 		return fmt.Errorf("构建交易上下文失败: %w", err)
 	}
 
@@ -395,7 +426,9 @@ func (at *AutoTrader) runCycle() error {
 	if reason, triggered := at.enforceRiskLimits(ctx.Account.TotalEquity); triggered {
 		record.Success = false
 		record.ErrorMessage = reason
-		at.decisionLogger.LogDecision(record)
+		if err := at.saveAndNotifyDecision(record, nil, cycleStart, time.Since(cycleStart)); err != nil {
+			log.Printf("⚠ 保存决策记录失败: %v", err)
+		}
 		log.Printf("⛔ 风险控制触发，暂停交易：%s | 恢复时间: %s", reason, at.stopUntil.Format(time.RFC3339))
 		return nil
 	}
@@ -487,7 +520,9 @@ func (at *AutoTrader) runCycle() error {
 			}
 		}
 
-		at.decisionLogger.LogDecision(record)
+		if saveErr := at.saveAndNotifyDecision(record, decision, cycleStart, time.Since(cycleStart)); saveErr != nil {
+			log.Printf("⚠ 保存决策记录失败: %v", saveErr)
+		}
 		return fmt.Errorf("获取AI决策失败: %w", err)
 	}
 
@@ -558,11 +593,292 @@ func (at *AutoTrader) runCycle() error {
 	at.updatePositionSnapshot(ctx.Positions)
 
 	// 10. 保存决策记录
-	if err := at.decisionLogger.LogDecision(record); err != nil {
+	if err := at.saveAndNotifyDecision(record, decision, cycleStart, time.Since(cycleStart)); err != nil {
 		log.Printf("⚠ 保存决策记录失败: %v", err)
 	}
 
 	return nil
+}
+
+// saveAndNotifyDecision 保存决策记录并尝试推送 Telegram 更新
+func (at *AutoTrader) saveAndNotifyDecision(record *logger.DecisionRecord, aiDecision *decision.FullDecision, cycleStart time.Time, cycleDuration time.Duration) error {
+	if record == nil {
+		return nil
+	}
+
+	err := at.decisionLogger.LogDecision(record)
+
+	if at.telegramSender != nil {
+		message := at.buildTelegramMessage(record, aiDecision, cycleStart, cycleDuration)
+		if message != "" {
+			at.telegramSender.SendAsync(message)
+		}
+	}
+
+	return err
+}
+
+// buildTelegramMessage 构建推送到 Telegram 的 Markdown 文本
+func (at *AutoTrader) buildTelegramMessage(record *logger.DecisionRecord, aiDecision *decision.FullDecision, cycleStart time.Time, cycleDuration time.Duration) string {
+	if record == nil {
+		return ""
+	}
+
+	var builder strings.Builder
+
+	cycleNumber := record.CycleNumber
+	if cycleNumber <= 0 {
+		cycleNumber = at.callCount
+	}
+
+	builder.WriteString(fmt.Sprintf("🤖 *交易AI决策更新* (周期 #%d)\n", cycleNumber))
+	builder.WriteString(fmt.Sprintf("📛 交易员: %s\n", escapeTelegramMarkdown(at.name)))
+
+	statusEmoji := "🟢"
+	statusText := "正常运行"
+	if !record.Success {
+		statusEmoji = "🟠"
+		statusText = "异常"
+	}
+	builder.WriteString(fmt.Sprintf("状态: %s %s\n", statusText, statusEmoji))
+	builder.WriteString(fmt.Sprintf("🕒 周期开始: `%s`\n", cycleStart.Format("2006-01-02 15:04:05")))
+	builder.WriteString(fmt.Sprintf("⏱️ 耗时: `%s`\n", formatDuration(cycleDuration)))
+
+	if record.AIRequestDurationMs > 0 {
+		builder.WriteString(fmt.Sprintf("🤖 AI耗时: `%s`\n", formatDuration(time.Duration(record.AIRequestDurationMs)*time.Millisecond)))
+	}
+
+	if hasAccountSnapshot(record.AccountState) {
+		equity := record.AccountState.TotalBalance + record.AccountState.TotalUnrealizedProfit
+		builder.WriteString(fmt.Sprintf("💰 权益: `%.2f` USDT | 可用: `%.2f` USDT\n",
+			equity, record.AccountState.AvailableBalance))
+		builder.WriteString(fmt.Sprintf("📉 未实现盈亏: `%.2f` USDT | 保证金率: `%.1f%%`\n",
+			record.AccountState.TotalUnrealizedProfit, record.AccountState.MarginUsedPct))
+
+		totalSlots := len(at.tradingCoins)
+		if totalSlots == 0 {
+			totalSlots = len(at.defaultCoins)
+		}
+
+		positionSummary := fmt.Sprintf("%d", len(record.Positions))
+		if totalSlots > 0 {
+			positionSummary = fmt.Sprintf("%d/%d", len(record.Positions), totalSlots)
+		}
+
+		builder.WriteString(fmt.Sprintf("📦 持仓: `%s` | 候选币种: `%d`\n", positionSummary, len(record.CandidateCoins)))
+	}
+
+	if len(record.CandidateCoins) > 0 {
+		builder.WriteString(fmt.Sprintf("📋 候选列表: %s\n",
+			escapeTelegramMarkdown(joinAndLimit(record.CandidateCoins, 8))))
+	}
+
+	var decisionLines []string
+	if aiDecision != nil {
+		for _, d := range aiDecision.Decisions {
+			if line := formatDecisionForTelegram(d); line != "" {
+				decisionLines = append(decisionLines, line)
+			}
+		}
+	}
+
+	if len(decisionLines) > 0 {
+		builder.WriteString("\n🧠 *AI 决策:*\n")
+		for _, line := range decisionLines {
+			builder.WriteString("• ")
+			builder.WriteString(line)
+			builder.WriteString("\n")
+		}
+	}
+
+	if len(record.ExecutionLog) > 0 {
+		builder.WriteString("\n🔁 *执行结果:*\n")
+		for _, logLine := range record.ExecutionLog {
+			builder.WriteString("• ")
+			builder.WriteString(escapeTelegramMarkdown(logLine))
+			builder.WriteString("\n")
+		}
+	}
+
+	if record.ErrorMessage != "" {
+		builder.WriteString("\n❌ *错误:* ")
+		builder.WriteString(escapeTelegramMarkdown(record.ErrorMessage))
+		builder.WriteString("\n")
+	}
+
+	message := strings.TrimSpace(builder.String())
+	runes := []rune(message)
+	if len(runes) > 4000 {
+		message = string(runes[:4000]) + "…"
+	}
+
+	return message
+}
+
+func hasAccountSnapshot(snapshot logger.AccountSnapshot) bool {
+	return snapshot.TotalBalance != 0 || snapshot.AvailableBalance != 0 || snapshot.TotalUnrealizedProfit != 0 || snapshot.PositionCount != 0 || snapshot.MarginUsedPct != 0 || snapshot.InitialBalance != 0
+}
+
+func formatDecisionForTelegram(d decision.Decision) string {
+	actionEmoji, actionText := telegramActionLabel(d.Action)
+	if actionEmoji == "" && actionText == "" {
+		return ""
+	}
+
+	var detailParts []string
+
+	switch d.Action {
+	case "open_long", "open_short":
+		if d.Leverage > 0 {
+			detailParts = append(detailParts, fmt.Sprintf("杠杆 %dx", d.Leverage))
+		}
+		if d.PositionSizeUSD > 0 {
+			detailParts = append(detailParts, fmt.Sprintf("仓位 %.2f USDT", d.PositionSizeUSD))
+		}
+		if d.StopLoss > 0 {
+			detailParts = append(detailParts, fmt.Sprintf("止损 %.4f", d.StopLoss))
+		}
+		if d.TakeProfit > 0 {
+			detailParts = append(detailParts, fmt.Sprintf("止盈 %.4f", d.TakeProfit))
+		}
+	case "update_stop_loss":
+		if d.NewStopLoss > 0 {
+			detailParts = append(detailParts, fmt.Sprintf("新止损 %.4f", d.NewStopLoss))
+		}
+	case "update_take_profit":
+		if d.NewTakeProfit > 0 {
+			detailParts = append(detailParts, fmt.Sprintf("新止盈 %.4f", d.NewTakeProfit))
+		}
+	case "partial_close":
+		if d.ClosePercentage > 0 {
+			detailParts = append(detailParts, fmt.Sprintf("平仓 %.0f%%", d.ClosePercentage))
+		}
+	}
+
+	if d.RiskUSD > 0 {
+		detailParts = append(detailParts, fmt.Sprintf("风险 %.2f USDT", d.RiskUSD))
+	}
+	if d.Confidence > 0 {
+		detailParts = append(detailParts, fmt.Sprintf("信心 %d%%", d.Confidence))
+	}
+
+	detail := ""
+	if len(detailParts) > 0 {
+		detail = " (" + strings.Join(detailParts, " | ") + ")"
+	}
+
+	reasoning := strings.TrimSpace(d.Reasoning)
+	if reasoning != "" {
+		reasoning = truncateReason(reasoning, 220)
+		reasoning = " — " + escapeTelegramMarkdown(reasoning)
+	}
+
+	prefix := strings.TrimSpace(fmt.Sprintf("%s %s", actionEmoji, actionText))
+	if prefix == "" {
+		prefix = actionEmoji
+	}
+
+	return fmt.Sprintf("%s %s%s%s", escapeTelegramMarkdown(prefix), escapeTelegramMarkdown(d.Symbol), escapeTelegramMarkdown(detail), reasoning)
+}
+
+func telegramActionLabel(action string) (string, string) {
+	switch action {
+	case "open_long":
+		return "🚀", "开多"
+	case "open_short":
+		return "📉", "开空"
+	case "close_long":
+		return "✅", "平多"
+	case "close_short":
+		return "✅", "平空"
+	case "update_stop_loss":
+		return "🛡️", "调整止损"
+	case "update_take_profit":
+		return "🎯", "调整止盈"
+	case "partial_close":
+		return "↘️", "部分平仓"
+	case "hold":
+		return "⏸️", "保持"
+	case "wait":
+		return "⏳", "等待"
+	default:
+		return "ℹ️", action
+	}
+}
+
+func formatDuration(d time.Duration) string {
+	if d < time.Millisecond {
+		return "0ms"
+	}
+
+	if d < time.Second {
+		return fmt.Sprintf("%dms", d.Milliseconds())
+	}
+
+	if d < time.Minute {
+		return fmt.Sprintf("%.1fs", d.Seconds())
+	}
+
+	minutes := int(d.Minutes())
+	seconds := int(d.Seconds()) % 60
+	if minutes < 60 {
+		if seconds == 0 {
+			return fmt.Sprintf("%dm", minutes)
+		}
+		return fmt.Sprintf("%dm%ds", minutes, seconds)
+	}
+
+	hours := minutes / 60
+	minutes = minutes % 60
+	if minutes == 0 && seconds == 0 {
+		return fmt.Sprintf("%dh", hours)
+	}
+	return fmt.Sprintf("%dh%dm%ds", hours, minutes, seconds)
+}
+
+func joinAndLimit(items []string, limit int) string {
+	if limit <= 0 || len(items) <= limit {
+		return strings.Join(items, ", ")
+	}
+
+	truncated := strings.Join(items[:limit], ", ") + "…"
+	return truncated
+}
+
+func truncateReason(text string, maxLen int) string {
+	if maxLen <= 0 {
+		return ""
+	}
+
+	runeText := []rune(text)
+	if len(runeText) <= maxLen {
+		return text
+	}
+	return string(runeText[:maxLen]) + "…"
+}
+
+func escapeTelegramMarkdown(text string) string {
+	replacer := strings.NewReplacer(
+		"_", "\\_",
+		"*", "\\*",
+		"[", "\\[",
+		"]", "\\]",
+		"(", "\\(",
+		")", "\\)",
+		"~", "\\~",
+		"`", "\\`",
+		">", "\\>",
+		"#", "\\#",
+		"+", "\\+",
+		"-", "\\-",
+		"=", "\\=",
+		"|", "\\|",
+		"{", "\\{",
+		"}", "\\}",
+		".", "\\.",
+		"!", "\\!",
+	)
+	return replacer.Replace(text)
 }
 
 // 每日重置盈亏基线

@@ -7,6 +7,7 @@ import (
 	"log"
 	"nofx/config"
 	"nofx/trader"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,15 +27,36 @@ type TraderManager struct {
 	traders          map[string]*trader.AutoTrader // key: trader ID
 	competitionCache *CompetitionCache
 	mu               sync.RWMutex
+	telegramBotToken string
+	telegramChatID   int64
+	telegramEnabled  bool
 }
 
 // NewTraderManager 创建trader管理器
 func NewTraderManager() *TraderManager {
+	botToken := strings.TrimSpace(os.Getenv("NOFX_TG_BOT_TOKEN"))
+	chatIDStr := strings.TrimSpace(os.Getenv("NOFX_TG_CHAT_ID"))
+	var chatID int64
+	telegramEnabled := false
+
+	if botToken != "" && chatIDStr != "" {
+		if parsedID, err := strconv.ParseInt(chatIDStr, 10, 64); err != nil {
+			log.Printf("⚠️ Telegram 通知 chat_id 无效: %s", chatIDStr)
+		} else {
+			chatID = parsedID
+			telegramEnabled = true
+			log.Printf("📨 Telegram 决策推送已启用 (chat_id=%d)", chatID)
+		}
+	}
+
 	return &TraderManager{
 		traders: make(map[string]*trader.AutoTrader),
 		competitionCache: &CompetitionCache{
 			data: make(map[string]interface{}),
 		},
+		telegramBotToken: botToken,
+		telegramChatID:   chatID,
+		telegramEnabled:  telegramEnabled,
 	}
 }
 
@@ -242,6 +264,9 @@ func (tm *TraderManager) addTraderFromDB(traderCfg *config.TraderRecord, aiModel
 		OrderStrategy:         traderCfg.OrderStrategy,        // 订单策略
 		LimitPriceOffset:      traderCfg.LimitPriceOffset,     // 限价偏移
 		LimitTimeoutSeconds:   traderCfg.LimitTimeoutSeconds,  // 限价超时
+		EnableTelegramUpdates: tm.telegramEnabled,
+		TelegramBotToken:      tm.telegramBotToken,
+		TelegramChatID:        tm.telegramChatID,
 	}
 
 	// 根据交易所类型设置API密钥
@@ -356,6 +381,9 @@ func (tm *TraderManager) AddTraderFromDB(traderCfg *config.TraderRecord, aiModel
 		OrderStrategy:         traderCfg.OrderStrategy,        // 订单策略
 		LimitPriceOffset:      traderCfg.LimitPriceOffset,     // 限价偏移
 		LimitTimeoutSeconds:   traderCfg.LimitTimeoutSeconds,  // 限价超时
+		EnableTelegramUpdates: tm.telegramEnabled,
+		TelegramBotToken:      tm.telegramBotToken,
+		TelegramChatID:        tm.telegramChatID,
 	}
 
 	// 根据交易所类型设置API密钥
@@ -464,6 +492,10 @@ func (tm *TraderManager) RemoveTrader(traderID string) error {
 				}
 			}
 		}
+	}
+
+	if trader != nil {
+		trader.Shutdown()
 	}
 
 	// 从map中删除
@@ -1146,33 +1178,36 @@ func (tm *TraderManager) loadSingleTrader(traderCfg *config.TraderRecord, aiMode
 	// 如果为空，将使用 NewAutoTrader 中的默认值 ["15m", "1h", "4h"]
 	// 构建AutoTraderConfig
 	traderConfig := trader.AutoTraderConfig{
-		ID:                   traderCfg.ID,
-		Name:                 traderCfg.Name,
-		AIModel:              aiModelCfg.Provider,    // 使用provider作为模型标识
-		Exchange:             exchangeCfg.ExchangeID, // 使用exchange ID
-		InitialBalance:       traderCfg.InitialBalance,
-		BTCETHLeverage:       traderCfg.BTCETHLeverage,
-		AltcoinLeverage:      traderCfg.AltcoinLeverage,
-		TakerFeeRate:         traderCfg.TakerFeeRate, // Taker fee rate from config
-		MakerFeeRate:         traderCfg.MakerFeeRate, // Maker fee rate from config
-		ScanInterval:         time.Duration(traderCfg.ScanIntervalMinutes) * time.Minute,
-		CoinPoolAPIURL:       effectiveCoinPoolURL,
-		OITopAPIURL:          effectiveOITopURL,
-		CustomAPIURL:         aiModelCfg.CustomAPIURL,    // 自定义API URL
-		CustomModelName:      aiModelCfg.CustomModelName, // 自定义模型名称
-		UseQwen:              aiModelCfg.Provider == "qwen",
-		MaxDailyLoss:         maxDailyLoss,
-		MaxDrawdown:          maxDrawdown,
-		StopTradingTime:      time.Duration(stopTradingMinutes) * time.Minute,
-		IsCrossMargin:        traderCfg.IsCrossMargin,
-		DefaultCoins:         defaultCoins,
-		TradingCoins:         tradingCoins,
-		SystemPromptTemplate: traderCfg.SystemPromptTemplate, // 系统提示词模板
-		OrderStrategy:        traderCfg.OrderStrategy,        // 订单策略
-		LimitPriceOffset:     traderCfg.LimitPriceOffset,     // 限价偏移
-		LimitTimeoutSeconds:  traderCfg.LimitTimeoutSeconds,  // 限价超时
-		HyperliquidTestnet:   exchangeCfg.Testnet,            // Hyperliquid测试网
-		Timeframes:           timeframes,                     // K线时间线配置
+		ID:                    traderCfg.ID,
+		Name:                  traderCfg.Name,
+		AIModel:               aiModelCfg.Provider,    // 使用provider作为模型标识
+		Exchange:              exchangeCfg.ExchangeID, // 使用exchange ID
+		InitialBalance:        traderCfg.InitialBalance,
+		BTCETHLeverage:        traderCfg.BTCETHLeverage,
+		AltcoinLeverage:       traderCfg.AltcoinLeverage,
+		TakerFeeRate:          traderCfg.TakerFeeRate, // Taker fee rate from config
+		MakerFeeRate:          traderCfg.MakerFeeRate, // Maker fee rate from config
+		ScanInterval:          time.Duration(traderCfg.ScanIntervalMinutes) * time.Minute,
+		CoinPoolAPIURL:        effectiveCoinPoolURL,
+		OITopAPIURL:           effectiveOITopURL,
+		CustomAPIURL:          aiModelCfg.CustomAPIURL,    // 自定义API URL
+		CustomModelName:       aiModelCfg.CustomModelName, // 自定义模型名称
+		UseQwen:               aiModelCfg.Provider == "qwen",
+		MaxDailyLoss:          maxDailyLoss,
+		MaxDrawdown:           maxDrawdown,
+		StopTradingTime:       time.Duration(stopTradingMinutes) * time.Minute,
+		IsCrossMargin:         traderCfg.IsCrossMargin,
+		DefaultCoins:          defaultCoins,
+		TradingCoins:          tradingCoins,
+		SystemPromptTemplate:  traderCfg.SystemPromptTemplate, // 系统提示词模板
+		OrderStrategy:         traderCfg.OrderStrategy,        // 订单策略
+		LimitPriceOffset:      traderCfg.LimitPriceOffset,     // 限价偏移
+		LimitTimeoutSeconds:   traderCfg.LimitTimeoutSeconds,  // 限价超时
+		HyperliquidTestnet:    exchangeCfg.Testnet,            // Hyperliquid测试网
+		Timeframes:            timeframes,                     // K线时间线配置
+		EnableTelegramUpdates: tm.telegramEnabled,
+		TelegramBotToken:      tm.telegramBotToken,
+		TelegramChatID:        tm.telegramChatID,
 	}
 
 	// 根据交易所类型设置API密钥
