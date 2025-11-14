@@ -195,6 +195,54 @@ func (s *AutoTraderTestSuite) TestNormalizeSymbol() {
 	}
 }
 
+func (s *AutoTraderTestSuite) TestBuildTelegramMessageIncludesKeyData() {
+	s.autoTrader.tradingCoins = []string{"BTCUSDT", "ETHUSDT", "SOLUSDT"}
+
+	record := &logger.DecisionRecord{
+		CycleNumber: 2,
+		AccountState: logger.AccountSnapshot{
+			TotalBalance:          10000,
+			AvailableBalance:      8000,
+			TotalUnrealizedProfit: 200,
+			PositionCount:         1,
+			MarginUsedPct:         35,
+			InitialBalance:        9500,
+		},
+		Positions: []logger.PositionSnapshot{
+			{Symbol: "BTCUSDT", Side: "long", PositionAmt: 0.5, EntryPrice: 60000, MarkPrice: 60500},
+		},
+		CandidateCoins: []string{"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"},
+		ExecutionLog:   []string{"✓ BTCUSDT open_long 成功"},
+		Success:        true,
+	}
+
+	decision := &decision.FullDecision{
+		Decisions: []decision.Decision{
+			{
+				Symbol:          "BTCUSDT",
+				Action:          "open_long",
+				Leverage:        5,
+				PositionSizeUSD: 1000,
+				StopLoss:        58000,
+				TakeProfit:      63000,
+				Confidence:      80,
+				Reasoning:       "趋势转多，量能放大",
+			},
+		},
+	}
+
+	start := time.Date(2024, time.January, 1, 12, 0, 0, 0, time.UTC)
+	msg := s.autoTrader.buildTelegramMessage(record, decision, start, 45*time.Second)
+
+	s.NotEmpty(msg)
+	s.Contains(msg, "周期 #2")
+	s.Contains(msg, "AI 决策")
+	s.Contains(msg, "执行结果")
+	s.Contains(msg, "趋势转多，量能放大")
+	s.Contains(msg, "候选列表")
+	s.Contains(msg, "杠杆 5x")
+}
+
 // ============================================================
 // 层次 2: Getter/Setter 测试
 // ============================================================
