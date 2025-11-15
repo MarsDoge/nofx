@@ -1271,14 +1271,6 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 		}
 	}
 
-	// 计算数量
-	quantity := decision.PositionSizeUSD / marketData.CurrentPrice
-	actionRecord.Quantity = quantity
-	actionRecord.Price = marketData.CurrentPrice
-
-	// ⚠️ 保证金验证：防止保证金不足错误（code=-2019）
-	requiredMargin := decision.PositionSizeUSD / float64(decision.Leverage)
-
 	balance, err := at.trader.GetBalance()
 	if err != nil {
 		return fmt.Errorf("获取账户余额失败: %w", err)
@@ -1288,14 +1280,23 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 		availableBalance = avail
 	}
 
-	// 手续费估算（Taker费率 0.04%）
-	estimatedFee := decision.PositionSizeUSD * 0.0004
-	totalRequired := requiredMargin + estimatedFee
-
-	if totalRequired > availableBalance {
-		return fmt.Errorf("❌ 保证金不足: 需要 %.2f USDT（保证金 %.2f + 手续费 %.2f），可用 %.2f USDT",
-			totalRequired, requiredMargin, estimatedFee, availableBalance)
+	feeRate := at.config.TakerFeeRate
+	if feeRate <= 0 {
+		feeRate = 0.0004
 	}
+
+	positionSizeUSD, _, _, _, err := at.preparePositionSizing(decision, availableBalance, feeRate)
+	if err != nil {
+		return err
+	}
+
+	quantity := positionSizeUSD / marketData.CurrentPrice
+	if quantity <= 0 {
+		return fmt.Errorf("无效的开仓数量: %.4f", quantity)
+	}
+
+	actionRecord.Quantity = quantity
+	actionRecord.Price = marketData.CurrentPrice
 
 	// ⚡ 严格验证止损/止盈价格（防止开仓后无法设置保护，导致仓位风险）
 	// 修复 Issue: 开仓成功但止损/止盈设置失败，仓位失去保护
@@ -1395,14 +1396,6 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 		}
 	}
 
-	// 计算数量
-	quantity := decision.PositionSizeUSD / marketData.CurrentPrice
-	actionRecord.Quantity = quantity
-	actionRecord.Price = marketData.CurrentPrice
-
-	// ⚠️ 保证金验证：防止保证金不足错误（code=-2019）
-	requiredMargin := decision.PositionSizeUSD / float64(decision.Leverage)
-
 	balance, err := at.trader.GetBalance()
 	if err != nil {
 		return fmt.Errorf("获取账户余额失败: %w", err)
@@ -1412,14 +1405,23 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 		availableBalance = avail
 	}
 
-	// 手续费估算（Taker费率 0.04%）
-	estimatedFee := decision.PositionSizeUSD * 0.0004
-	totalRequired := requiredMargin + estimatedFee
-
-	if totalRequired > availableBalance {
-		return fmt.Errorf("❌ 保证金不足: 需要 %.2f USDT（保证金 %.2f + 手续费 %.2f），可用 %.2f USDT",
-			totalRequired, requiredMargin, estimatedFee, availableBalance)
+	feeRate := at.config.TakerFeeRate
+	if feeRate <= 0 {
+		feeRate = 0.0004
 	}
+
+	positionSizeUSD, _, _, _, err := at.preparePositionSizing(decision, availableBalance, feeRate)
+	if err != nil {
+		return err
+	}
+
+	quantity := positionSizeUSD / marketData.CurrentPrice
+	if quantity <= 0 {
+		return fmt.Errorf("无效的开仓数量: %.4f", quantity)
+	}
+
+	actionRecord.Quantity = quantity
+	actionRecord.Price = marketData.CurrentPrice
 
 	// ⚡ 严格验证止损/止盈价格（防止开仓后无法设置保护，导致仓位风险）
 	// 修复 Issue: 开仓成功但止损/止盈设置失败，仓位失去保护
@@ -1480,6 +1482,73 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	}
 
 	return nil
+}
+
+func (at *AutoTrader) preparePositionSizing(decision *decision.Decision, availableBalance, feeRate float64) (positionSizeUSD, requiredMargin, estimatedFee, totalRequired float64, err error) {
+	leverage := float64(decision.Leverage)
+	if leverage <= 0 {
+		return 0, 0, 0, 0, fmt.Errorf("无效的杠杆倍数: %d", decision.Leverage)
+	}
+
+	positionSizeUSD = decision.PositionSizeUSD
+	requiredMargin = positionSizeUSD / leverage
+	estimatedFee = positionSizeUSD * feeRate
+	totalRequired = requiredMargin + estimatedFee
+
+	if totalRequired <= availableBalance {
+		return positionSizeUSD, requiredMargin, estimatedFee, totalRequired, nil
+	}
+
+	denominator := (1.0 / leverage) + feeRate
+	if denominator <= 0 {
+		return 0, 0, 0, 0, fmt.Errorf("无效的保证金或手续费配置（杠杆=%d, 手续费率=%.6f）", decision.Leverage, feeRate)
+	}
+
+	maxAffordableUSD := availableBalance / denominator
+	adjustedPositionUSD := maxAffordableUSD * 0.995
+
+	if adjustedPositionUSD <= 0 {
+		return 0, requiredMargin, estimatedFee, totalRequired,
+			fmt.Errorf("❌ 保证金不足: 需要 %.2f USDT（保证金 %.2f + 手续费 %.2f），可用 %.2f USDT",
+				totalRequired, requiredMargin, estimatedFee, availableBalance)
+	}
+
+	if adjustedPositionUSD < positionSizeUSD {
+		log.Printf("  ⚠️ 可用余额 %.2f USDT 不足以支撑计划开仓 %.2f USDT，将自动降额至 %.2f USDT（包含手续费缓冲）",
+			availableBalance, positionSizeUSD, adjustedPositionUSD)
+		positionSizeUSD = adjustedPositionUSD
+		requiredMargin = positionSizeUSD / leverage
+		estimatedFee = positionSizeUSD * feeRate
+		totalRequired = requiredMargin + estimatedFee
+	}
+
+	if totalRequired > availableBalance {
+		safetyAvailable := availableBalance * 0.995
+		if safetyAvailable <= 0 {
+			return 0, requiredMargin, estimatedFee, totalRequired,
+				fmt.Errorf("❌ 保证金不足: 需要 %.2f USDT（保证金 %.2f + 手续费 %.2f），可用 %.2f USDT",
+					totalRequired, requiredMargin, estimatedFee, availableBalance)
+		}
+
+		positionSizeUSD = math.Min(positionSizeUSD, safetyAvailable/denominator)
+		if positionSizeUSD <= 0 {
+			return 0, requiredMargin, estimatedFee, totalRequired,
+				fmt.Errorf("❌ 保证金不足: 需要 %.2f USDT（保证金 %.2f + 手续费 %.2f），可用 %.2f USDT",
+					totalRequired, requiredMargin, estimatedFee, availableBalance)
+		}
+
+		requiredMargin = positionSizeUSD / leverage
+		estimatedFee = positionSizeUSD * feeRate
+		totalRequired = requiredMargin + estimatedFee
+
+		if totalRequired > availableBalance {
+			return 0, requiredMargin, estimatedFee, totalRequired,
+				fmt.Errorf("❌ 保证金不足: 需要 %.2f USDT（保证金 %.2f + 手续费 %.2f），可用 %.2f USDT",
+					totalRequired, requiredMargin, estimatedFee, availableBalance)
+		}
+	}
+
+	return positionSizeUSD, requiredMargin, estimatedFee, totalRequired, nil
 }
 
 // executeCloseLongWithRecord 执行平多仓并记录详细信息
