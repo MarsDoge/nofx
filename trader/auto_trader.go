@@ -655,6 +655,12 @@ func (at *AutoTrader) buildTelegramMessage(record *logger.DecisionRecord, aiDeci
 		builder.WriteString(fmt.Sprintf("📉 未实现盈亏: `%.2f` USDT | 保证金率: `%.1f%%`\n",
 			record.AccountState.TotalUnrealizedProfit, record.AccountState.MarginUsedPct))
 
+		if record.AccountState.InitialBalance > 0 {
+			roi := (equity - record.AccountState.InitialBalance) / record.AccountState.InitialBalance * 100
+			builder.WriteString(fmt.Sprintf("💹 ROI: `%+.2f%%` (起始 `%.2f`)\n",
+				roi, record.AccountState.InitialBalance))
+		}
+
 		totalSlots := len(at.tradingCoins)
 		if totalSlots == 0 {
 			totalSlots = len(at.defaultCoins)
@@ -671,6 +677,19 @@ func (at *AutoTrader) buildTelegramMessage(record *logger.DecisionRecord, aiDeci
 	if len(record.CandidateCoins) > 0 {
 		builder.WriteString(fmt.Sprintf("📋 候选列表: %s\n",
 			escapeTelegramMarkdown(joinAndLimit(record.CandidateCoins, 8))))
+	}
+
+	if len(record.Positions) > 0 {
+		builder.WriteString("\n📊 *持仓明细:*\n")
+		positionLines := formatPositionLines(record.Positions, 3)
+		for _, line := range positionLines {
+			builder.WriteString("• ")
+			builder.WriteString(line)
+			builder.WriteString("\n")
+		}
+		if len(record.Positions) > len(positionLines) {
+			builder.WriteString(fmt.Sprintf("…其余 %d 个持仓\n", len(record.Positions)-len(positionLines)))
+		}
 	}
 
 	var decisionLines []string
@@ -843,6 +862,77 @@ func joinAndLimit(items []string, limit int) string {
 
 	truncated := strings.Join(items[:limit], ", ") + "…"
 	return truncated
+}
+
+func formatPositionLines(positions []logger.PositionSnapshot, limit int) []string {
+	if limit <= 0 {
+		limit = len(positions)
+	}
+
+	lines := make([]string, 0, limit)
+	for i, pos := range positions {
+		if i >= limit {
+			break
+		}
+		lines = append(lines, formatPositionLine(pos))
+	}
+	return lines
+}
+
+func formatPositionLine(pos logger.PositionSnapshot) string {
+	symbol := escapeTelegramMarkdown(pos.Symbol)
+	line := fmt.Sprintf("%s %s (%s) %.4f @ %.4f | 现 %.4f | %s %.2f USDT",
+		positionSideIcon(pos.Side),
+		symbol,
+		positionSideLabel(pos.Side),
+		pos.PositionAmt,
+		pos.EntryPrice,
+		pos.MarkPrice,
+		pnlIndicator(pos.UnrealizedProfit),
+		pos.UnrealizedProfit,
+	)
+
+	if pos.Leverage > 0 {
+		line += fmt.Sprintf(" | 杠杆 %.1fx", pos.Leverage)
+	}
+
+	return line
+}
+
+func positionSideIcon(side string) string {
+	switch strings.ToLower(side) {
+	case "long":
+		return "🚀"
+	case "short":
+		return "📉"
+	default:
+		return "ℹ️"
+	}
+}
+
+func positionSideLabel(side string) string {
+	switch strings.ToLower(side) {
+	case "long":
+		return "多"
+	case "short":
+		return "空"
+	default:
+		if side == "" {
+			return ""
+		}
+		return strings.Title(side)
+	}
+}
+
+func pnlIndicator(pnl float64) string {
+	switch {
+	case pnl > 0:
+		return "🟢"
+	case pnl < 0:
+		return "🔴"
+	default:
+		return "⚪"
+	}
 }
 
 func truncateReason(text string, maxLen int) string {

@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
-	"net/http"
 
 	"github.com/gorilla/websocket"
 )
@@ -19,6 +21,9 @@ type CombinedStreamsClient struct {
 	reconnect   bool
 	done        chan struct{}
 	batchSize   int // 每批订阅的流数量
+	readyMu     sync.Mutex
+	readyCond   *sync.Cond
+	ready       bool
 
 	// 测试用 hook（生产环境为 nil）
 	// 重连时调用，传入需要重新订阅的流列表
@@ -26,18 +31,30 @@ type CombinedStreamsClient struct {
 }
 
 func NewCombinedStreamsClient(batchSize int) *CombinedStreamsClient {
-	return &CombinedStreamsClient{
+	c := &CombinedStreamsClient{
 		subscribers: make(map[string]chan []byte),
 		reconnect:   true,
 		done:        make(chan struct{}),
 		batchSize:   batchSize,
 	}
+	c.readyCond = sync.NewCond(&c.readyMu)
+	return c
 }
 
 func (c *CombinedStreamsClient) Connect() error {
+	proxyFunc := http.ProxyFromEnvironment
+	if proxyURL, err := getCustomProxyURL(); err != nil {
+		return fmt.Errorf("组合流代理配置错误: %w", err)
+	} else if proxyURL != nil {
+		log.Printf("组合流WebSocket将通过代理连接: %s", proxyURL)
+		proxyFunc = func(*http.Request) (*url.URL, error) {
+			return proxyURL, nil
+		}
+	}
+
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
-		Proxy           : http.ProxyFromEnvironment,
+		Proxy:            proxyFunc,
 	}
 
 	// 组合流使用不同的端点
@@ -51,6 +68,10 @@ func (c *CombinedStreamsClient) Connect() error {
 	c.mu.Unlock()
 
 	log.Println("组合流WebSocket连接成功")
+	c.readyMu.Lock()
+	c.ready = true
+	c.readyCond.Broadcast()
+	c.readyMu.Unlock()
 	go c.readMessages()
 
 	return nil
@@ -99,6 +120,9 @@ func (c *CombinedStreamsClient) splitIntoBatches(symbols []string, batchSize int
 
 // subscribeStreams 订阅多个流
 func (c *CombinedStreamsClient) subscribeStreams(streams []string) error {
+	if err := c.waitForConnection(); err != nil {
+		return err
+	}
 	subscribeMsg := map[string]interface{}{
 		"method": "SUBSCRIBE",
 		"params": streams,
@@ -180,6 +204,11 @@ func (c *CombinedStreamsClient) handleReconnect() {
 		return
 	}
 
+	c.readyMu.Lock()
+	c.ready = false
+	c.readyCond.Broadcast()
+	c.readyMu.Unlock()
+
 	log.Println("组合流尝试重新连接...")
 	time.Sleep(3 * time.Second)
 
@@ -230,4 +259,40 @@ func (c *CombinedStreamsClient) Close() {
 		close(ch)
 		delete(c.subscribers, stream)
 	}
+
+	c.readyMu.Lock()
+	c.ready = false
+	c.readyCond.Broadcast()
+	c.readyMu.Unlock()
+}
+
+func (c *CombinedStreamsClient) waitForConnection() error {
+	c.readyMu.Lock()
+	defer c.readyMu.Unlock()
+
+	for !c.ready && c.reconnect {
+		c.readyCond.Wait()
+	}
+
+	if !c.ready {
+		return fmt.Errorf("WebSocket未连接")
+	}
+	return nil
+}
+
+func getCustomProxyURL() (*url.URL, error) {
+	for _, key := range []string{"PROXY", "proxy"} {
+		if raw, ok := os.LookupEnv(key); ok {
+			value := strings.TrimSpace(raw)
+			if value == "" {
+				continue
+			}
+			parsed, err := url.Parse(value)
+			if err != nil {
+				return nil, fmt.Errorf("无效的代理地址 %q: %w", value, err)
+			}
+			return parsed, nil
+		}
+	}
+	return nil, nil
 }
