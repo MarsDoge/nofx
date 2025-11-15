@@ -1329,6 +1329,12 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 
 	// 开仓
 	order, err := at.trader.OpenLong(decision.Symbol, quantity, decision.Leverage)
+	if err != nil && isMarginInsufficientError(err) {
+		log.Printf("  ⚠️ %s 开多仓保证金不足: %v，尝试刷新余额并降额重试", decision.Symbol, err)
+		order, err = at.retryOpenPositionWithReducedSize(decision, actionRecord, marketData.CurrentPrice, availableBalance, feeRate, func(q float64) (map[string]interface{}, error) {
+			return at.trader.OpenLong(decision.Symbol, q, decision.Leverage)
+		})
+	}
 	if err != nil {
 		return err
 	}
@@ -1454,6 +1460,12 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 
 	// 开仓
 	order, err := at.trader.OpenShort(decision.Symbol, quantity, decision.Leverage)
+	if err != nil && isMarginInsufficientError(err) {
+		log.Printf("  ⚠️ %s 开空仓保证金不足: %v，尝试刷新余额并降额重试", decision.Symbol, err)
+		order, err = at.retryOpenPositionWithReducedSize(decision, actionRecord, marketData.CurrentPrice, availableBalance, feeRate, func(q float64) (map[string]interface{}, error) {
+			return at.trader.OpenShort(decision.Symbol, q, decision.Leverage)
+		})
+	}
 	if err != nil {
 		return err
 	}
@@ -1549,6 +1561,67 @@ func (at *AutoTrader) preparePositionSizing(decision *decision.Decision, availab
 	}
 
 	return positionSizeUSD, requiredMargin, estimatedFee, totalRequired, nil
+}
+
+type balanceCacheInvalidator interface {
+	InvalidateBalanceCache()
+}
+
+func isMarginInsufficientError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errMsg := err.Error()
+	return strings.Contains(errMsg, "Margin is insufficient") || strings.Contains(errMsg, "-2019")
+}
+
+func (at *AutoTrader) retryOpenPositionWithReducedSize(
+	decision *decision.Decision,
+	actionRecord *logger.DecisionAction,
+	currentPrice float64,
+	availableBalance float64,
+	feeRate float64,
+	orderFunc func(quantity float64) (map[string]interface{}, error),
+) (map[string]interface{}, error) {
+	freshAvailable := at.refreshAvailableBalance(availableBalance)
+	safetyAvailable := freshAvailable * 0.97 // 预留 3% 缓冲，防止紧贴可用保证金
+	if safetyAvailable <= 0 {
+		return nil, fmt.Errorf("❌ 保证金不足: 实时可用余额 %.2f USDT，无法安全开仓", freshAvailable)
+	}
+
+	positionSizeUSD, _, _, _, err := at.preparePositionSizing(decision, safetyAvailable, feeRate)
+	if err != nil {
+		return nil, err
+	}
+
+	quantity := positionSizeUSD / currentPrice
+	if quantity <= 0 {
+		return nil, fmt.Errorf("调整后开仓数量无效: %.6f", quantity)
+	}
+
+	log.Printf("  ↘️ 自动降额至 %.2f USDT（数量 %.6f）后重新尝试开仓", positionSizeUSD, quantity)
+	actionRecord.Quantity = quantity
+	return orderFunc(quantity)
+}
+
+func (at *AutoTrader) refreshAvailableBalance(current float64) float64 {
+	if invalidator, ok := at.trader.(balanceCacheInvalidator); ok {
+		invalidator.InvalidateBalanceCache()
+	}
+
+	balance, err := at.trader.GetBalance()
+	if err != nil {
+		log.Printf("  ⚠️ 刷新账户余额失败: %v（沿用当前可用 %.2f USDT）", err, current)
+		return current
+	}
+
+	if avail, ok := balance["availableBalance"].(float64); ok && avail > 0 {
+		log.Printf("  ↺ 实时可用余额更新为 %.2f USDT", avail)
+		return avail
+	}
+
+	log.Printf("  ⚠️ 账户余额缺少 availableBalance 字段（沿用 %.2f USDT）", current)
+	return current
 }
 
 // executeCloseLongWithRecord 执行平多仓并记录详细信息

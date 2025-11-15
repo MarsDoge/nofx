@@ -732,7 +732,7 @@ func (s *AutoTraderTestSuite) TestExecuteUpdateStopOrTakeProfit() {
 			currentPrice: 50000.0,
 			newPrice:     51000.0,
 			hasPosition:  true,
-			expectedErr:  "多单止损必须低于当前价格",
+			expectedErr:  "多单止损价异常偏高",
 			executeFn: func(d *decision.Decision, a *logger.DecisionAction) error {
 				return s.autoTrader.executeUpdateStopLossWithRecord(d, a)
 			},
@@ -745,7 +745,7 @@ func (s *AutoTraderTestSuite) TestExecuteUpdateStopOrTakeProfit() {
 			currentPrice: 50000.0,
 			newPrice:     49000.0,
 			hasPosition:  true,
-			expectedErr:  "多单止盈必须高于当前价格",
+			expectedErr:  "多单止盈价异常偏低",
 			executeFn: func(d *decision.Decision, a *logger.DecisionAction) error {
 				return s.autoTrader.executeUpdateTakeProfitWithRecord(d, a)
 			},
