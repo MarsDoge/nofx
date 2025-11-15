@@ -82,6 +82,8 @@ func (s *AutoTraderTestSuite) SetupTest() {
 		BTCETHLeverage:       10,
 		AltcoinLeverage:      5,
 		IsCrossMargin:        true,
+		TakerFeeRate:         0.0004,
+		MakerFeeRate:         0.0002,
 	}
 
 	// 创建 AutoTrader 实例（直接构造，不调用 NewAutoTrader 以避免外部依赖）
@@ -462,13 +464,14 @@ func (s *AutoTraderTestSuite) TestBuildTradingContext() {
 // TestExecuteOpenPosition 测试开仓操作（多空通用）
 func (s *AutoTraderTestSuite) TestExecuteOpenPosition() {
 	tests := []struct {
-		name          string
-		action        string
-		expectedOrder int64
-		existingSide  string
-		availBalance  float64
-		expectedErr   string
-		executeFn     func(*decision.Decision, *logger.DecisionAction) error
+		name           string
+		action         string
+		expectedOrder  int64
+		existingSide   string
+		availBalance   float64
+		expectedErr    string
+		expectAdjusted bool
+		executeFn      func(*decision.Decision, *logger.DecisionAction) error
 	}{
 		{
 			name:          "成功开多仓",
@@ -484,6 +487,26 @@ func (s *AutoTraderTestSuite) TestExecuteOpenPosition() {
 			action:        "open_short",
 			expectedOrder: 123457,
 			availBalance:  8000.0,
+			executeFn: func(d *decision.Decision, a *logger.DecisionAction) error {
+				return s.autoTrader.executeOpenShortWithRecord(d, a)
+			},
+		},
+		{
+			name:           "多仓_余额略不足自动降额",
+			action:         "open_long",
+			expectedOrder:  123456,
+			availBalance:   100.3,
+			expectAdjusted: true,
+			executeFn: func(d *decision.Decision, a *logger.DecisionAction) error {
+				return s.autoTrader.executeOpenLongWithRecord(d, a)
+			},
+		},
+		{
+			name:           "空仓_余额略不足自动降额",
+			action:         "open_short",
+			expectedOrder:  123457,
+			availBalance:   100.3,
+			expectAdjusted: true,
 			executeFn: func(d *decision.Decision, a *logger.DecisionAction) error {
 				return s.autoTrader.executeOpenShortWithRecord(d, a)
 			},
@@ -556,6 +579,7 @@ func (s *AutoTraderTestSuite) TestExecuteOpenPosition() {
 				decision.TakeProfit = 48000.0 // 空单止盈 < 当前价
 			}
 			actionRecord := &logger.DecisionAction{Action: tt.action, Symbol: "BTCUSDT"}
+			originalQty := decision.PositionSizeUSD / 50000.0
 
 			err := tt.executeFn(decision, actionRecord)
 
@@ -566,6 +590,11 @@ func (s *AutoTraderTestSuite) TestExecuteOpenPosition() {
 				s.NoError(err)
 				s.Equal(tt.expectedOrder, actionRecord.OrderID)
 				s.Greater(actionRecord.Quantity, 0.0)
+				if tt.expectAdjusted {
+					s.Less(actionRecord.Quantity, originalQty)
+				} else {
+					s.InEpsilon(actionRecord.Quantity, originalQty, 1e-9)
+				}
 				s.Equal(50000.0, actionRecord.Price)
 			}
 

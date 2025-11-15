@@ -65,6 +65,9 @@ type FuturesTrader struct {
 	orderStrategy       string  // Order strategy: "market_only", "conservative_hybrid", "limit_only"
 	limitPriceOffset    float64 // Limit order price offset percentage (e.g., -0.03 for -0.03%)
 	limitTimeoutSeconds int     // Timeout in seconds before converting to market order
+
+	minNotionalCache map[string]float64
+	minNotionalMutex sync.RWMutex
 }
 
 // NewFuturesTrader 创建合约交易器
@@ -89,6 +92,7 @@ func newFuturesTraderWithClient(client *futures.Client, orderStrategy string, li
 		orderStrategy:       orderStrategy,
 		limitPriceOffset:    limitPriceOffset,
 		limitTimeoutSeconds: limitTimeoutSeconds,
+		minNotionalCache:    make(map[string]float64),
 	}
 
 	// 设置双向持仓模式（Hedge Mode）
@@ -1173,8 +1177,58 @@ func (t *FuturesTrader) SetTakeProfit(symbol string, positionSide string, quanti
 
 // GetMinNotional 获取最小名义价值（Binance要求）
 func (t *FuturesTrader) GetMinNotional(symbol string) float64 {
-	// 使用保守的默认值 10 USDT，确保订单能够通过交易所验证
-	return 10.0
+	t.minNotionalMutex.RLock()
+	if value, ok := t.minNotionalCache[symbol]; ok {
+		t.minNotionalMutex.RUnlock()
+		return value
+	}
+	t.minNotionalMutex.RUnlock()
+
+	t.minNotionalMutex.Lock()
+	defer t.minNotionalMutex.Unlock()
+
+	if value, ok := t.minNotionalCache[symbol]; ok {
+		return value
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	exchangeInfo, err := t.client.NewExchangeInfoService().Do(ctx)
+	if err != nil {
+		log.Printf("⚠️ 获取 %s 最小名义价值失败，使用默认值: %v", symbol, err)
+		t.minNotionalCache[symbol] = 100.0
+		return t.minNotionalCache[symbol]
+	}
+
+	for _, s := range exchangeInfo.Symbols {
+		if s.Symbol != symbol {
+			continue
+		}
+
+		for _, filter := range s.Filters {
+			filterType, ok := filter["filterType"].(string)
+			if !ok || filterType != "MIN_NOTIONAL" {
+				continue
+			}
+
+			if notionalStr, ok := filter["notional"].(string); ok {
+				if notional, err := strconv.ParseFloat(notionalStr, 64); err == nil {
+					t.minNotionalCache[symbol] = notional
+					return notional
+				}
+			}
+
+			if notionalFloat, ok := filter["notional"].(float64); ok {
+				t.minNotionalCache[symbol] = notionalFloat
+				return notionalFloat
+			}
+		}
+	}
+
+	t.minNotionalCache[symbol] = 100.0
+	log.Printf("⚠️ 未在交易规则中找到 %s 的最小名义价值，使用默认值 100 USDT", symbol)
+	return t.minNotionalCache[symbol]
 }
 
 // CheckMinNotional 检查订单是否满足最小名义价值要求
