@@ -71,6 +71,7 @@ sudo apt-get install libta-lib0-dev
 - Gradually increase trading amounts
 - Adjust scan intervals (3-5 minutes recommended)
 - Use default coin list for beginners
+- Need a short-term scalping setup? Start from `config/trader.short_scalp.json.example` (1-minute scan + 1m/3m/5m/15m/1h K线组合) and tweak per your risk budget.
 
 ---
 
