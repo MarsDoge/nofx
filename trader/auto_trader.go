@@ -11,6 +11,7 @@ import (
 	"nofx/market"
 	"nofx/mcp"
 	"nofx/pool"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -230,6 +231,9 @@ func NewAutoTrader(config AutoTraderConfig, database interface{}, userID string)
 	default:
 		return nil, fmt.Errorf("不支持的交易平台: %s", config.Exchange)
 	}
+
+	config.ScanInterval = enforceScanInterval(config.ScanInterval, config.Name)
+	config.Timeframes = ensureTimeframes(config.Timeframes, config.Name)
 
 	// 验证初始金额配置
 	if config.InitialBalance <= 0 {
@@ -565,23 +569,34 @@ func (at *AutoTrader) runCycle() error {
 
 	// 执行决策并记录结果
 	for _, d := range sortedDecisions {
+		decisionToExecute := d
 		actionRecord := logger.DecisionAction{
-			Action:    d.Action,
-			Symbol:    d.Symbol,
+			Action:    decisionToExecute.Action,
+			Symbol:    decisionToExecute.Symbol,
 			Quantity:  0,
-			Leverage:  d.Leverage,
+			Leverage:  decisionToExecute.Leverage,
 			Price:     0,
 			Timestamp: time.Now(),
 			Success:   false,
 		}
 
-		if err := at.executeDecisionWithRecord(&d, &actionRecord); err != nil {
-			log.Printf("❌ 执行决策失败 (%s %s): %v", d.Symbol, d.Action, err)
+		if forced, msg := at.enforceReasoningOrWait(&decisionToExecute); forced {
+			actionRecord.Action = decisionToExecute.Action
+			actionRecord.Success = true
+			record.ExecutionLog = append(record.ExecutionLog, msg)
+			record.Decisions = append(record.Decisions, actionRecord)
+			continue
+		}
+
+		if err := at.executeDecisionWithRecord(&decisionToExecute, &actionRecord); err != nil {
+			log.Printf("❌ 执行决策失败 (%s %s): %v", decisionToExecute.Symbol, decisionToExecute.Action, err)
 			actionRecord.Error = err.Error()
-			record.ExecutionLog = append(record.ExecutionLog, fmt.Sprintf("❌ %s %s 失败: %v", d.Symbol, d.Action, err))
+			record.ExecutionLog = append(record.ExecutionLog,
+				fmt.Sprintf("❌ %s %s 失败: %v", decisionToExecute.Symbol, decisionToExecute.Action, err))
 		} else {
 			actionRecord.Success = true
-			record.ExecutionLog = append(record.ExecutionLog, fmt.Sprintf("✓ %s %s 成功", d.Symbol, d.Action))
+			record.ExecutionLog = append(record.ExecutionLog,
+				fmt.Sprintf("✓ %s %s 成功", decisionToExecute.Symbol, decisionToExecute.Action))
 			// 成功执行后短暂延迟
 			time.Sleep(1 * time.Second)
 		}
@@ -1053,7 +1068,6 @@ func (at *AutoTrader) buildTradingContext() (*decision.Context, error) {
 	if avail, ok := balance["availableBalance"].(float64); ok {
 		availableBalance = avail
 	}
-
 	// Total Equity = 钱包余额 + 未实现盈亏
 	totalEquity := totalWalletBalance + totalUnrealizedProfit
 
@@ -1279,6 +1293,7 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	if avail, ok := balance["availableBalance"].(float64); ok {
 		availableBalance = avail
 	}
+	accountEquity := at.estimateAccountEquity(balance, availableBalance)
 
 	feeRate := at.config.TakerFeeRate
 	if feeRate <= 0 {
@@ -1309,14 +1324,14 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	// 多单：止损必须 < 当前价，止盈必须 > 当前价
 	if decision.StopLoss >= marketData.CurrentPrice {
 		priceGapPct := ((decision.StopLoss - marketData.CurrentPrice) / marketData.CurrentPrice) * 100
-		return fmt.Errorf("❌ 多单止损价不合理：止损价 %.2f 必须低于当前价 %.2f (当前高出 %.2f%%)。"+
+		return fmt.Errorf("❌ 多单止损价异常偏高：止损价 %.2f 必须低于当前价 %.2f (当前高出 %.2f%%)。"+
 			"建议：AI 应设置低于当前价的止损价，例如 %.2f",
 			decision.StopLoss, marketData.CurrentPrice, priceGapPct, marketData.CurrentPrice*0.98)
 	}
 
 	if decision.TakeProfit <= marketData.CurrentPrice {
 		priceGapPct := ((marketData.CurrentPrice - decision.TakeProfit) / marketData.CurrentPrice) * 100
-		return fmt.Errorf("❌ 多单止盈价不合理：止盈价 %.2f 必须高于当前价 %.2f (当前低于 %.2f%%)。"+
+		return fmt.Errorf("❌ 多单止盈价异常偏低：止盈价 %.2f 必须高于当前价 %.2f (当前低于 %.2f%%)。"+
 			"建议：AI 应设置高于当前价的止盈价，例如 %.2f",
 			decision.TakeProfit, marketData.CurrentPrice, priceGapPct, marketData.CurrentPrice*1.02)
 	}
@@ -1334,6 +1349,9 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 		order, err = at.retryOpenPositionWithReducedSize(decision, actionRecord, marketData.CurrentPrice, availableBalance, feeRate, func(q float64) (map[string]interface{}, error) {
 			return at.trader.OpenLong(decision.Symbol, q, decision.Leverage)
 		})
+		if err == nil && actionRecord.Quantity > 0 {
+			quantity = actionRecord.Quantity
+		}
 	}
 	if err != nil {
 		return err
@@ -1343,6 +1361,8 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	if orderID, ok := order["orderId"].(int64); ok {
 		actionRecord.OrderID = orderID
 	}
+
+	at.annotateRisk(decision, actionRecord, "LONG", quantity, actionRecord.Price, decision.StopLoss, accountEquity)
 
 	log.Printf("  ✓ 开仓成功，订单ID: %v, 数量: %.4f", order["orderId"], quantity)
 
@@ -1410,6 +1430,7 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	if avail, ok := balance["availableBalance"].(float64); ok {
 		availableBalance = avail
 	}
+	accountEquity := at.estimateAccountEquity(balance, availableBalance)
 
 	feeRate := at.config.TakerFeeRate
 	if feeRate <= 0 {
@@ -1465,6 +1486,9 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 		order, err = at.retryOpenPositionWithReducedSize(decision, actionRecord, marketData.CurrentPrice, availableBalance, feeRate, func(q float64) (map[string]interface{}, error) {
 			return at.trader.OpenShort(decision.Symbol, q, decision.Leverage)
 		})
+		if err == nil && actionRecord.Quantity > 0 {
+			quantity = actionRecord.Quantity
+		}
 	}
 	if err != nil {
 		return err
@@ -1474,6 +1498,8 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	if orderID, ok := order["orderId"].(int64); ok {
 		actionRecord.OrderID = orderID
 	}
+
+	at.annotateRisk(decision, actionRecord, "SHORT", quantity, actionRecord.Price, decision.StopLoss, accountEquity)
 
 	log.Printf("  ✓ 开仓成功，订单ID: %v, 数量: %.4f", order["orderId"], quantity)
 
@@ -1635,10 +1661,18 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 	}
 	actionRecord.Price = marketData.CurrentPrice
 
-	// 平仓
+	// 平仓（失败自动退化为市价兜底）
 	order, err := at.trader.CloseLong(decision.Symbol, 0) // 0 = 全部平仓
 	if err != nil {
-		return err
+		log.Printf("  ⚠️ 平多仓失败: %v，尝试取消挂单并改用市价单", err)
+		if cancelErr := at.trader.CancelAllOrders(decision.Symbol); cancelErr != nil {
+			log.Printf("  ⚠️ 取消挂单失败: %v", cancelErr)
+		}
+		order, err = at.trader.CloseLong(decision.Symbol, 0)
+		if err != nil {
+			return err
+		}
+		log.Printf("  ✓ 平多仓改用市价单成功")
 	}
 
 	// 记录订单ID
@@ -1661,10 +1695,18 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 	}
 	actionRecord.Price = marketData.CurrentPrice
 
-	// 平仓
+	// 平仓（失败自动退化为市价兜底）
 	order, err := at.trader.CloseShort(decision.Symbol, 0) // 0 = 全部平仓
 	if err != nil {
-		return err
+		log.Printf("  ⚠️ 平空仓失败: %v，尝试取消挂单并改用市价单", err)
+		if cancelErr := at.trader.CancelAllOrders(decision.Symbol); cancelErr != nil {
+			log.Printf("  ⚠️ 取消挂单失败: %v", cancelErr)
+		}
+		order, err = at.trader.CloseShort(decision.Symbol, 0)
+		if err != nil {
+			return err
+		}
+		log.Printf("  ✓ 平空仓改用市价单成功")
 	}
 
 	// 记录订单ID
@@ -1738,7 +1780,7 @@ func (at *AutoTrader) executeUpdateStopLossWithRecord(decision *decision.Decisio
 		priceGap = decision.NewStopLoss - marketData.CurrentPrice
 		if priceGap > 0 {
 			// ❌ 多单止损价高于当前价 - 会立即触发，交易所会拒绝
-			return fmt.Errorf("多单止损必须低于当前价格 (当前: %.2f, 止损: %.2f)",
+			return fmt.Errorf("多单止损价异常偏高：多单止损必须低于当前价格 (当前: %.2f, 止损: %.2f)",
 				marketData.CurrentPrice, decision.NewStopLoss)
 		}
 	} else {
@@ -1853,7 +1895,7 @@ func (at *AutoTrader) executeUpdateTakeProfitWithRecord(decision *decision.Decis
 		priceGap = marketData.CurrentPrice - decision.NewTakeProfit
 		if priceGap > 0 {
 			// ❌ 多单止盈价低于当前价 - 会立即触发，交易所会拒绝
-			return fmt.Errorf("多单止盈必须高于当前价格 (当前: %.2f, 止盈: %.2f)",
+			return fmt.Errorf("多单止盈价异常偏低：多单止盈必须高于当前价格 (当前: %.2f, 止盈: %.2f)",
 				marketData.CurrentPrice, decision.NewTakeProfit)
 		}
 	} else {
@@ -2852,4 +2894,206 @@ func (at *AutoTrader) reinitializeMCPClient() error {
 		at.config.CustomModelName, at.config.AIModel, at.config.CustomAPIURL)
 
 	return nil
+}
+
+func enforceScanInterval(interval time.Duration, traderName string) time.Duration {
+	minInterval := 2 * time.Minute
+	maxInterval := 3 * time.Minute
+
+	if interval <= 0 {
+		log.Printf("⚙️ [%s] 未配置扫描间隔，默认使用 3m", traderName)
+		return 3 * time.Minute
+	}
+
+	if interval < minInterval {
+		log.Printf("⚠️ [%s] 扫描间隔 %.2f 分钟过快，自动调整为 2m", traderName, interval.Minutes())
+		return minInterval
+	}
+
+	if interval > maxInterval {
+		log.Printf("⚠️ [%s] 扫描间隔 %.2f 分钟过慢，自动调整为 3m", traderName, interval.Minutes())
+		return maxInterval
+	}
+
+	return interval
+}
+
+func ensureTimeframes(configured []string, traderName string) []string {
+	defaultTF := []string{"3m", "5m", "15m", "1h", "4h"}
+
+	if len(configured) == 0 {
+		log.Printf("⚙️ [%s] 未配置时间线，默认使用 %v", traderName, defaultTF)
+		return append([]string{}, defaultTF...)
+	}
+
+	seen := make(map[string]bool)
+	normalized := make([]string, 0, len(configured))
+
+	for _, tf := range configured {
+		tf = strings.ToLower(strings.TrimSpace(tf))
+		if tf == "" || seen[tf] {
+			continue
+		}
+		seen[tf] = true
+		normalized = append(normalized, tf)
+	}
+
+	if len(normalized) == 0 {
+		log.Printf("⚙️ [%s] 时间线列表为空，默认使用 %v", traderName, defaultTF)
+		return append([]string{}, defaultTF...)
+	}
+
+	if !seen["1h"] {
+		insertIdx := len(normalized)
+		for idx, tf := range normalized {
+			if tf == "4h" || tf == "6h" || tf == "12h" || tf == "1d" {
+				insertIdx = idx
+				break
+			}
+		}
+		normalized = insertString(normalized, insertIdx, "1h")
+		log.Printf("⚙️ [%s] 时间线缺少 1h，已自动补齐: %v", traderName, normalized)
+	}
+
+	return normalized
+}
+
+func insertString(values []string, index int, value string) []string {
+	if index < 0 || index > len(values) {
+		index = len(values)
+	}
+	values = append(values, "")
+	copy(values[index+1:], values[index:])
+	values[index] = value
+	return values
+}
+
+var checklistLinePattern = regexp.MustCompile(`^((\d+|[①②③④⑤⑥⑦⑧⑨])[\.\)、\)]|[一二三四五六七八九]+\s*[、\.)])`)
+
+func countChecklistItems(reasoning string) int {
+	lines := strings.Split(reasoning, "\n")
+	count := 0
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if checklistLinePattern.MatchString(line) ||
+			strings.HasPrefix(line, "- ") ||
+			strings.HasPrefix(line, "* ") ||
+			strings.HasPrefix(line, "•") ||
+			strings.HasPrefix(line, "✔") ||
+			strings.HasPrefix(line, "✅") {
+			count++
+		}
+	}
+	return count
+}
+
+func (at *AutoTrader) enforceReasoningOrWait(decision *decision.Decision) (bool, string) {
+	if decision == nil {
+		return false, ""
+	}
+
+	if decision.Action != "open_long" && decision.Action != "open_short" {
+		return false, ""
+	}
+
+	reasoning := strings.TrimSpace(decision.Reasoning)
+	upper := strings.ToUpper(reasoning)
+	lower := strings.ToLower(reasoning)
+	missing := []string{}
+
+	if reasoning == "" || (!strings.Contains(reasoning, "状态") && !strings.Contains(lower, "state")) {
+		missing = append(missing, "状态识别")
+	}
+
+	checklistCount := countChecklistItems(reasoning)
+	if checklistCount < 7 {
+		missing = append(missing, fmt.Sprintf("入场验证 %d/7", checklistCount))
+	}
+
+	if !strings.Contains(upper, "RR") && !strings.Contains(reasoning, "风险回报") {
+		missing = append(missing, "RR 计算")
+	}
+
+	if len(missing) == 0 {
+		return false, ""
+	}
+
+	originalAction := decision.Action
+	summary := fmt.Sprintf("⚠️ %s %s 缺少关键信息: %s → 自动 wait",
+		decision.Symbol, originalAction, strings.Join(missing, "、"))
+	decision.Action = "wait"
+	decision.Reasoning = fmt.Sprintf("Skipped due to missing sections: %s", strings.Join(missing, "、"))
+	log.Println(summary)
+	return true, summary
+}
+
+func calculateRiskUSD(quantity, entryPrice, stopLoss float64, side string) float64 {
+	if quantity <= 0 || entryPrice <= 0 || stopLoss <= 0 {
+		return 0
+	}
+
+	var riskPerUnit float64
+	switch strings.ToUpper(side) {
+	case "LONG":
+		riskPerUnit = entryPrice - stopLoss
+	case "SHORT":
+		riskPerUnit = stopLoss - entryPrice
+	default:
+		return 0
+	}
+
+	if riskPerUnit <= 0 {
+		return 0
+	}
+
+	return riskPerUnit * quantity
+}
+
+func (at *AutoTrader) estimateAccountEquity(balance map[string]interface{}, fallback float64) float64 {
+	wallet, _ := balance["totalWalletBalance"].(float64)
+	unrealized, _ := balance["totalUnrealizedProfit"].(float64)
+	equity := wallet + unrealized
+
+	if equity <= 0 {
+		if avail, ok := balance["availableBalance"].(float64); ok && avail > 0 {
+			equity = avail
+		}
+	}
+
+	if equity <= 0 {
+		if fallback > 0 {
+			equity = fallback
+		} else {
+			equity = at.initialBalance
+		}
+	}
+
+	return equity
+}
+
+func (at *AutoTrader) annotateRisk(decision *decision.Decision, actionRecord *logger.DecisionAction, side string, quantity, entryPrice, stopLoss, equity float64) {
+	riskUSD := calculateRiskUSD(quantity, entryPrice, stopLoss, side)
+	if riskUSD <= 0 {
+		return
+	}
+
+	originalRisk := decision.RiskUSD
+	decision.RiskUSD = riskUSD
+	actionRecord.RiskUSD = riskUSD
+	if equity > 0 {
+		actionRecord.RiskPct = (riskUSD / equity) * 100
+	}
+
+	message := fmt.Sprintf("  📏 实际风险: %.2f USDT (%.2f%% / Equity %.2f)", riskUSD, actionRecord.RiskPct, equity)
+	if originalRisk > 0 && math.Abs(originalRisk-riskUSD) > 0.01 {
+		message += fmt.Sprintf(" [AI请求 %.2f]", originalRisk)
+	}
+	log.Println(message)
+
+	if actionRecord.RiskPct > 4 {
+		log.Printf("  ⚠️ 风险占比 %.2f%% 超过 4%%，建议 AI 调整仓位或止损", actionRecord.RiskPct)
+	}
 }

@@ -1176,7 +1176,12 @@ func (t *FuturesTrader) SetTakeProfit(symbol string, positionSide string, quanti
 }
 
 // GetMinNotional 获取最小名义价值（Binance要求）
+const defaultMinNotional = 5.0
+
 func (t *FuturesTrader) GetMinNotional(symbol string) float64 {
+	if t.minNotionalCache == nil {
+		t.minNotionalCache = make(map[string]float64)
+	}
 	t.minNotionalMutex.RLock()
 	if value, ok := t.minNotionalCache[symbol]; ok {
 		t.minNotionalMutex.RUnlock()
@@ -1196,8 +1201,8 @@ func (t *FuturesTrader) GetMinNotional(symbol string) float64 {
 
 	exchangeInfo, err := t.client.NewExchangeInfoService().Do(ctx)
 	if err != nil {
-		log.Printf("⚠️ 获取 %s 最小名义价值失败，使用默认值: %v", symbol, err)
-		t.minNotionalCache[symbol] = 100.0
+		log.Printf("⚠️ 获取 %s 最小名义价值失败，使用默认值 %.2f USDT: %v", symbol, defaultMinNotional, err)
+		t.minNotionalCache[symbol] = defaultMinNotional
 		return t.minNotionalCache[symbol]
 	}
 
@@ -1226,8 +1231,8 @@ func (t *FuturesTrader) GetMinNotional(symbol string) float64 {
 		}
 	}
 
-	t.minNotionalCache[symbol] = 100.0
-	log.Printf("⚠️ 未在交易规则中找到 %s 的最小名义价值，使用默认值 100 USDT", symbol)
+	t.minNotionalCache[symbol] = defaultMinNotional
+	log.Printf("⚠️ 未在交易规则中找到 %s 的最小名义价值，使用默认值 %.2f USDT", symbol, defaultMinNotional)
 	return t.minNotionalCache[symbol]
 }
 

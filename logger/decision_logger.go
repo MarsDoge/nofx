@@ -54,12 +54,14 @@ type PositionSnapshot struct {
 
 // DecisionAction 决策动作
 type DecisionAction struct {
-	Action    string    `json:"action"`    // open_long, open_short, close_long, close_short, update_stop_loss, update_take_profit, partial_close
-	Symbol    string    `json:"symbol"`    // 币种
-	Quantity  float64   `json:"quantity"`  // 数量（部分平仓时使用）
-	Leverage  int       `json:"leverage"`  // 杠杆（开仓时）
-	Price     float64   `json:"price"`     // 执行价格
-	OrderID   int64     `json:"order_id"`  // 订单ID
+	Action    string    `json:"action"`   // open_long, open_short, close_long, close_short, update_stop_loss, update_take_profit, partial_close
+	Symbol    string    `json:"symbol"`   // 币种
+	Quantity  float64   `json:"quantity"` // 数量（部分平仓时使用）
+	Leverage  int       `json:"leverage"` // 杠杆（开仓时）
+	Price     float64   `json:"price"`    // 执行价格
+	OrderID   int64     `json:"order_id"` // 订单ID
+	RiskUSD   float64   `json:"risk_usd,omitempty"`
+	RiskPct   float64   `json:"risk_pct,omitempty"`
 	Timestamp time.Time `json:"timestamp"` // 执行时间
 	Success   bool      `json:"success"`   // 是否成功
 	Error     string    `json:"error"`     // 错误信息
