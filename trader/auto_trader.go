@@ -143,6 +143,7 @@ type AutoTrader struct {
 	database              interface{}                      // 数据库引用（用于自动更新余额）
 	userID                string                           // 用户ID
 	telegramSender        *logger.TelegramSender           // Telegram 推送发送器
+	lastCoTTrace          string                           // 最近一次AI思维链（用于合规检查）
 }
 
 // NewAutoTrader 创建自动交易器
@@ -484,6 +485,12 @@ func (at *AutoTrader) runCycle() error {
 	// 5. 调用AI获取完整决策
 	log.Printf("🤖 正在请求AI分析并决策... [模板: %s]", at.systemPromptTemplate)
 	decision, err := decision.GetFullDecisionWithCustomPrompt(ctx, at.mcpClient, at.customPrompt, at.overrideBasePrompt, at.systemPromptTemplate)
+
+	if decision == nil {
+		at.lastCoTTrace = ""
+	} else {
+		at.lastCoTTrace = strings.TrimSpace(decision.CoTTrace)
+	}
 
 	if decision != nil && decision.AIRequestDurationMs > 0 {
 		record.AIRequestDurationMs = decision.AIRequestDurationMs
@@ -2990,6 +2997,23 @@ func countChecklistItems(reasoning string) int {
 	return count
 }
 
+func (at *AutoTrader) combinedReasoning(decision *decision.Decision) string {
+	var parts []string
+	if decision != nil {
+		if r := strings.TrimSpace(decision.Reasoning); r != "" {
+			parts = append(parts, r)
+		}
+	}
+
+	if at != nil {
+		if trace := strings.TrimSpace(at.lastCoTTrace); trace != "" {
+			parts = append(parts, trace)
+		}
+	}
+
+	return strings.TrimSpace(strings.Join(parts, "\n\n"))
+}
+
 func (at *AutoTrader) enforceReasoningOrWait(decision *decision.Decision) (bool, string) {
 	if decision == nil {
 		return false, ""
@@ -2999,7 +3023,7 @@ func (at *AutoTrader) enforceReasoningOrWait(decision *decision.Decision) (bool,
 		return false, ""
 	}
 
-	reasoning := strings.TrimSpace(decision.Reasoning)
+	reasoning := at.combinedReasoning(decision)
 	upper := strings.ToUpper(reasoning)
 	lower := strings.ToLower(reasoning)
 	missing := []string{}

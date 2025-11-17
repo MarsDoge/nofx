@@ -21,6 +21,7 @@ type CombinedStreamsClient struct {
 	reconnect   bool
 	done        chan struct{}
 	batchSize   int // 每批订阅的流数量
+	writeCh     chan wsRequest
 	readyMu     sync.Mutex
 	readyCond   *sync.Cond
 	ready       bool
@@ -36,9 +37,16 @@ func NewCombinedStreamsClient(batchSize int) *CombinedStreamsClient {
 		reconnect:   true,
 		done:        make(chan struct{}),
 		batchSize:   batchSize,
+		writeCh:     make(chan wsRequest, 128),
 	}
 	c.readyCond = sync.NewCond(&c.readyMu)
+	go c.writeLoop()
 	return c
+}
+
+type wsRequest struct {
+	payload map[string]interface{}
+	resp    chan error
 }
 
 func (c *CombinedStreamsClient) Connect() error {
@@ -129,15 +137,79 @@ func (c *CombinedStreamsClient) subscribeStreams(streams []string) error {
 		"id":     time.Now().UnixNano(),
 	}
 
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	log.Printf("订阅流: %v", streams)
+	return c.enqueueRequest(subscribeMsg)
+}
 
-	if c.conn == nil {
+func (c *CombinedStreamsClient) enqueueRequest(payload map[string]interface{}) error {
+	if payload == nil {
+		return fmt.Errorf("WebSocket请求为空")
+	}
+
+	req := wsRequest{
+		payload: payload,
+		resp:    make(chan error, 1),
+	}
+
+	select {
+	case c.writeCh <- req:
+	case <-c.done:
+		return fmt.Errorf("WebSocket已关闭")
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("WebSocket写入排队超时")
+	}
+
+	return <-req.resp
+}
+
+func (c *CombinedStreamsClient) writeLoop() {
+	for {
+		select {
+		case <-c.done:
+			c.drainPendingRequests()
+			return
+		case req := <-c.writeCh:
+			if req.payload == nil {
+				req.resp <- fmt.Errorf("WebSocket请求为空")
+				continue
+			}
+			err := c.writeJSON(req.payload)
+			req.resp <- err
+		}
+	}
+}
+
+func (c *CombinedStreamsClient) drainPendingRequests() {
+	for {
+		select {
+		case req := <-c.writeCh:
+			if req.resp != nil {
+				req.resp <- fmt.Errorf("WebSocket已关闭")
+			}
+		default:
+			return
+		}
+	}
+}
+
+func (c *CombinedStreamsClient) writeJSON(payload map[string]interface{}) error {
+	if err := c.waitForConnection(); err != nil {
+		return err
+	}
+
+	c.mu.RLock()
+	conn := c.conn
+	c.mu.RUnlock()
+
+	if conn == nil {
 		return fmt.Errorf("WebSocket未连接")
 	}
 
-	log.Printf("订阅流: %v", streams)
-	return c.conn.WriteJSON(subscribeMsg)
+	if err := conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return err
+	}
+
+	return conn.WriteJSON(payload)
 }
 
 func (c *CombinedStreamsClient) readMessages() {
