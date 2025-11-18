@@ -1133,9 +1133,9 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 			}
 		}
 
-		// 硬约束：风险回报比必须≥3.0
-		if riskRewardRatio < 3.0 {
-			return fmt.Errorf("风险回报比过低(%.2f:1)，必须≥3.0:1 [风险:%.2f%% 收益:%.2f%%] [止损:%.2f 止盈:%.2f]",
+		// 硬约束：风险回报比必须≥2.0
+		if riskRewardRatio < 2.0 {
+			return fmt.Errorf("风险回报比过低(%.2f:1)，必须≥2.0:1 [风险:%.2f%% 收益:%.2f%%] [止损:%.2f 止盈:%.2f]",
 				riskRewardRatio, riskPercent, rewardPercent, d.StopLoss, d.TakeProfit)
 		}
 	}
