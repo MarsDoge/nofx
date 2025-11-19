@@ -17,6 +17,11 @@ import (
 	"time"
 )
 
+const (
+	maxAutoCloseRetries   = 3
+	rebalanceMarginBuffer = 1.02
+)
+
 // AutoTraderConfig 自动交易配置（简化版 - AI全权决策）
 type AutoTraderConfig struct {
 	// Trader标识
@@ -1351,13 +1356,23 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 
 	// 开仓
 	order, err := at.trader.OpenLong(decision.Symbol, quantity, decision.Leverage)
-	if err != nil && isMarginInsufficientError(err) {
-		log.Printf("  ⚠️ %s 开多仓保证金不足: %v，尝试刷新余额并降额重试", decision.Symbol, err)
-		order, err = at.retryOpenPositionWithReducedSize(decision, actionRecord, marketData.CurrentPrice, availableBalance, feeRate, func(q float64) (map[string]interface{}, error) {
-			return at.trader.OpenLong(decision.Symbol, q, decision.Leverage)
-		})
-		if err == nil && actionRecord.Quantity > 0 {
-			quantity = actionRecord.Quantity
+	if err != nil {
+		if isMarginInsufficientError(err) {
+			log.Printf("  ⚠️ %s 开多仓保证金不足: %v，尝试刷新余额并降额重试", decision.Symbol, err)
+			order, err = at.retryOpenPositionWithReducedSize(decision, actionRecord, marketData.CurrentPrice, availableBalance, feeRate, func(q float64) (map[string]interface{}, error) {
+				return at.trader.OpenLong(decision.Symbol, q, decision.Leverage)
+			})
+			if err == nil && actionRecord.Quantity > 0 {
+				quantity = actionRecord.Quantity
+			}
+		} else if isMinTradeSizeError(err) {
+			var adjustedQty float64
+			order, adjustedQty, availableBalance, err = at.autoCloseAndRetryOpen(decision, actionRecord, marketData, availableBalance, feeRate, func(q float64) (map[string]interface{}, error) {
+				return at.trader.OpenLong(decision.Symbol, q, decision.Leverage)
+			}, err, "open_long")
+			if err == nil {
+				quantity = adjustedQty
+			}
 		}
 	}
 	if err != nil {
@@ -1488,13 +1503,23 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 
 	// 开仓
 	order, err := at.trader.OpenShort(decision.Symbol, quantity, decision.Leverage)
-	if err != nil && isMarginInsufficientError(err) {
-		log.Printf("  ⚠️ %s 开空仓保证金不足: %v，尝试刷新余额并降额重试", decision.Symbol, err)
-		order, err = at.retryOpenPositionWithReducedSize(decision, actionRecord, marketData.CurrentPrice, availableBalance, feeRate, func(q float64) (map[string]interface{}, error) {
-			return at.trader.OpenShort(decision.Symbol, q, decision.Leverage)
-		})
-		if err == nil && actionRecord.Quantity > 0 {
-			quantity = actionRecord.Quantity
+	if err != nil {
+		if isMarginInsufficientError(err) {
+			log.Printf("  ⚠️ %s 开空仓保证金不足: %v，尝试刷新余额并降额重试", decision.Symbol, err)
+			order, err = at.retryOpenPositionWithReducedSize(decision, actionRecord, marketData.CurrentPrice, availableBalance, feeRate, func(q float64) (map[string]interface{}, error) {
+				return at.trader.OpenShort(decision.Symbol, q, decision.Leverage)
+			})
+			if err == nil && actionRecord.Quantity > 0 {
+				quantity = actionRecord.Quantity
+			}
+		} else if isMinTradeSizeError(err) {
+			var adjustedQty float64
+			order, adjustedQty, availableBalance, err = at.autoCloseAndRetryOpen(decision, actionRecord, marketData, availableBalance, feeRate, func(q float64) (map[string]interface{}, error) {
+				return at.trader.OpenShort(decision.Symbol, q, decision.Leverage)
+			}, err, "open_short")
+			if err == nil {
+				quantity = adjustedQty
+			}
 		}
 	}
 	if err != nil {
@@ -1608,6 +1633,28 @@ func isMarginInsufficientError(err error) bool {
 	return strings.Contains(errMsg, "Margin is insufficient") || strings.Contains(errMsg, "-2019")
 }
 
+func isMinTradeSizeError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errMsg := err.Error()
+	lowerMsg := strings.ToLower(errMsg)
+	return strings.Contains(errMsg, "开仓数量过小") ||
+		strings.Contains(errMsg, "低于最小要求") ||
+		strings.Contains(lowerMsg, "min notional") ||
+		strings.Contains(lowerMsg, "lot_size")
+}
+
+func isNoPositionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "没有找到") &&
+		(strings.Contains(msg, "多仓") || strings.Contains(msg, "空仓"))
+}
+
 func (at *AutoTrader) retryOpenPositionWithReducedSize(
 	decision *decision.Decision,
 	actionRecord *logger.DecisionAction,
@@ -1657,6 +1704,172 @@ func (at *AutoTrader) refreshAvailableBalance(current float64) float64 {
 	return current
 }
 
+func (at *AutoTrader) autoCloseAndRetryOpen(
+	decision *decision.Decision,
+	actionRecord *logger.DecisionAction,
+	marketData *market.Data,
+	availableBalance float64,
+	feeRate float64,
+	orderFunc func(quantity float64) (map[string]interface{}, error),
+	originalErr error,
+	action string,
+) (map[string]interface{}, float64, float64, error) {
+	currentAvailable := availableBalance
+	lastErr := originalErr
+
+	for attempt := 0; attempt < maxAutoCloseRetries; attempt++ {
+		if closeErr := at.autoCloseOldestPositionForRebalance(
+			decision.Symbol,
+			action,
+			currentAvailable,
+			marketData.CurrentPrice,
+			decision,
+			feeRate,
+		); closeErr != nil {
+			if lastErr != nil {
+				return nil, 0, currentAvailable, fmt.Errorf("%w（原始错误: %v）", closeErr, lastErr)
+			}
+			return nil, 0, currentAvailable, closeErr
+		}
+
+		freshAvailable := at.refreshAvailableBalance(currentAvailable)
+		currentAvailable = freshAvailable
+
+		positionSizeUSD, _, _, _, sizeErr := at.preparePositionSizing(decision, freshAvailable, feeRate)
+		if sizeErr != nil {
+			return nil, 0, freshAvailable, sizeErr
+		}
+
+		quantity := positionSizeUSD / marketData.CurrentPrice
+		if quantity <= 0 {
+			return nil, 0, freshAvailable, fmt.Errorf("平仓后重新计算的开仓数量无效: %.6f", quantity)
+		}
+
+		actionRecord.Quantity = quantity
+		order, err := orderFunc(quantity)
+		if err == nil {
+			return order, quantity, freshAvailable, nil
+		}
+
+		lastErr = err
+		if !isMinTradeSizeError(err) {
+			return nil, quantity, freshAvailable,
+				fmt.Errorf("平掉盈利仓位后仍无法安全开仓，请降低仓位或等待余额恢复: %w", err)
+		}
+	}
+
+	return nil, 0, currentAvailable, fmt.Errorf("自动平仓释放保证金后仍无法满足最小下单要求: %v", lastErr)
+}
+
+func (at *AutoTrader) autoCloseOldestPositionForRebalance(
+	triggerSymbol, action string,
+	currentAvailable float64,
+	marketPrice float64,
+	decision *decision.Decision,
+	feeRate float64,
+) error {
+	positions, err := at.trader.GetPositions()
+	if err != nil {
+		return fmt.Errorf("获取持仓失败: %w", err)
+	}
+
+	var selected map[string]interface{}
+	var selectedKey string
+	oldestTs := int64(math.MaxInt64)
+	selectedPnL := 0.0
+
+	for _, pos := range positions {
+		symbol, _ := pos["symbol"].(string)
+		side, _ := pos["side"].(string)
+		if symbol == "" || side == "" {
+			continue
+		}
+
+		entryPrice, _ := pos["entryPrice"].(float64)
+		markPrice, _ := pos["markPrice"].(float64)
+		rawQty, _ := pos["positionAmt"].(float64)
+		lev, _ := pos["leverage"].(float64)
+		if lev <= 0 {
+			lev = float64(decision.Leverage)
+		}
+		qty := math.Abs(rawQty)
+		if qty == 0 || entryPrice <= 0 || markPrice <= 0 || lev <= 0 {
+			continue
+		}
+
+		var pnl float64
+		if strings.ToLower(side) == "long" {
+			pnl = (markPrice - entryPrice) * qty
+		} else {
+			pnl = (entryPrice - markPrice) * qty
+		}
+		if pnl <= 0 {
+			continue
+		}
+
+		key := symbol + "_" + side
+		ts := at.positionFirstSeenTime[key]
+		if ts == 0 {
+			ts = 0
+		}
+
+		notional := entryPrice * qty
+		freedMargin := notional / lev
+		estimatedAvailable := currentAvailable + freedMargin + pnl
+
+		positionSizeUSD, _, _, totalRequired, err := at.preparePositionSizing(decision, estimatedAvailable, feeRate)
+		if err != nil {
+			continue
+		}
+		requiredWithBuffer := totalRequired * rebalanceMarginBuffer
+		if estimatedAvailable < requiredWithBuffer {
+			continue
+		}
+
+		quantity := positionSizeUSD / marketPrice
+		if quantity <= 0 {
+			continue
+		}
+
+		if ts < oldestTs {
+			oldestTs = ts
+			selected = pos
+			selectedKey = key
+			selectedPnL = pnl
+		}
+	}
+
+	if selected == nil {
+		return fmt.Errorf("当前没有盈利的持仓可用于释放保证金，或即使平仓也无法满足保证金要求")
+	}
+
+	symbol := selected["symbol"].(string)
+	side := selected["side"].(string)
+	log.Printf("  ↺ %s %s 触发最小下单限制，自动平掉较早持仓 %s %s 以释放保证金 (未实现盈亏: %.2f USDT)",
+		triggerSymbol, action, symbol, strings.ToUpper(side), selectedPnL)
+
+	var closeErr error
+	switch side {
+	case "long":
+		_, closeErr = at.trader.CloseLong(symbol, 0)
+	case "short":
+		_, closeErr = at.trader.CloseShort(symbol, 0)
+	default:
+		return fmt.Errorf("未知持仓方向: %s", side)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("自动平仓 %s %s 失败: %w", symbol, side, closeErr)
+	}
+
+	if selectedKey != "" {
+		delete(at.positionFirstSeenTime, selectedKey)
+		delete(at.positionStopLoss, selectedKey)
+		delete(at.positionTakeProfit, selectedKey)
+	}
+	at.ClearPeakPnLCache(symbol, side)
+	return nil
+}
+
 // executeCloseLongWithRecord 执行平多仓并记录详细信息
 func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, actionRecord *logger.DecisionAction) error {
 	log.Printf("  🔄 平多仓: %s", decision.Symbol)
@@ -1671,6 +1884,10 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 	// 平仓（失败自动退化为市价兜底）
 	order, err := at.trader.CloseLong(decision.Symbol, 0) // 0 = 全部平仓
 	if err != nil {
+		if isNoPositionError(err) {
+			log.Printf("  ℹ️ %s 当前无多仓，忽略平仓请求", decision.Symbol)
+			return nil
+		}
 		log.Printf("  ⚠️ 平多仓失败: %v，尝试取消挂单并改用市价单", err)
 		if cancelErr := at.trader.CancelAllOrders(decision.Symbol); cancelErr != nil {
 			log.Printf("  ⚠️ 取消挂单失败: %v", cancelErr)
@@ -1705,6 +1922,10 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 	// 平仓（失败自动退化为市价兜底）
 	order, err := at.trader.CloseShort(decision.Symbol, 0) // 0 = 全部平仓
 	if err != nil {
+		if isNoPositionError(err) {
+			log.Printf("  ℹ️ %s 当前无空仓，忽略平仓请求", decision.Symbol)
+			return nil
+		}
 		log.Printf("  ⚠️ 平空仓失败: %v，尝试取消挂单并改用市价单", err)
 		if cancelErr := at.trader.CancelAllOrders(decision.Symbol); cancelErr != nil {
 			log.Printf("  ⚠️ 取消挂单失败: %v", cancelErr)
@@ -1786,16 +2007,22 @@ func (at *AutoTrader) executeUpdateStopLossWithRecord(decision *decision.Decisio
 	if positionSide == "LONG" {
 		priceGap = decision.NewStopLoss - marketData.CurrentPrice
 		if priceGap > 0 {
-			// ❌ 多单止损价高于当前价 - 会立即触发，交易所会拒绝
-			return fmt.Errorf("多单止损价异常偏高：多单止损必须低于当前价格 (当前: %.2f, 止损: %.2f)",
-				marketData.CurrentPrice, decision.NewStopLoss)
+			// ❌ 多单止损价高于当前价 - 会立即触发
+			log.Printf("  ⚠️ 多单止损异常: 当前价 %.2f, 止损 %.2f，按照交易所规则会立即触发", marketData.CurrentPrice, decision.NewStopLoss)
+			log.Printf("  ↘️ 启动防御策略: 直接平掉 %s 多单以锁定利润", decision.Symbol)
+			decision.Action = "close_long"
+			actionRecord.Action = "close_long"
+			return at.executeCloseLongWithRecord(decision, actionRecord)
 		}
 	} else {
 		priceGap = marketData.CurrentPrice - decision.NewStopLoss
 		if priceGap > 0 {
-			// ❌ 空单止损价低于当前价 - 会立即触发，交易所会拒绝
-			return fmt.Errorf("空单止损必须高于当前价格 (当前: %.2f, 止损: %.2f)",
-				marketData.CurrentPrice, decision.NewStopLoss)
+			// ❌ 空单止损价低于当前价 - 会立即触发
+			log.Printf("  ⚠️ 空单止损异常: 当前价 %.2f, 止损 %.2f，按照交易所规则会立即触发", marketData.CurrentPrice, decision.NewStopLoss)
+			log.Printf("  ↘️ 启动防御策略: 直接平掉 %s 空单以锁定利润", decision.Symbol)
+			decision.Action = "close_short"
+			actionRecord.Action = "close_short"
+			return at.executeCloseShortWithRecord(decision, actionRecord)
 		}
 	}
 

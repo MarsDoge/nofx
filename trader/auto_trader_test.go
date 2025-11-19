@@ -605,20 +605,191 @@ func (s *AutoTraderTestSuite) TestExecuteOpenPosition() {
 	}
 }
 
+func (s *AutoTraderTestSuite) TestExecuteOpenLongAutoCloseWhenSizeTooSmall() {
+	s.patches.ApplyFunc(market.Get, func(symbol string) (*market.Data, error) {
+		return &market.Data{Symbol: symbol, CurrentPrice: 1000.0}, nil
+	})
+
+	s.mockTrader.balance["availableBalance"] = 0.5
+	s.mockTrader.positions = []map[string]interface{}{
+		{"symbol": "LTCUSDT", "side": "short", "positionAmt": -5.0, "entryPrice": 950.0, "markPrice": 900.0},
+	}
+	s.autoTrader.positionFirstSeenTime["LTCUSDT_short"] = time.Now().Add(-time.Hour).UnixMilli()
+	s.mockTrader.openLongErrors = []error{
+		fmt.Errorf("开仓数量过小，格式化后为 0 (原始: 0.00263111 → 格式化: 0.00)"),
+		nil,
+	}
+	s.mockTrader.onCloseShort = func() {
+		s.mockTrader.balance["availableBalance"] = 8000.0
+		s.mockTrader.positions = []map[string]interface{}{}
+	}
+
+	decision := &decision.Decision{
+		Action:          "open_long",
+		Symbol:          "BTCUSDT",
+		PositionSizeUSD: 1000.0,
+		Leverage:        5,
+		StopLoss:        950.0,
+		TakeProfit:      1050.0,
+	}
+	actionRecord := &logger.DecisionAction{Action: "open_long", Symbol: "BTCUSDT"}
+
+	err := s.autoTrader.executeOpenLongWithRecord(decision, actionRecord)
+
+	s.NoError(err)
+	s.Equal(int64(123456), actionRecord.OrderID)
+	s.Equal(2, s.mockTrader.openLongCallCount)
+	s.Equal(1, s.mockTrader.closeShortCallCount)
+	s.InEpsilon(1.0, actionRecord.Quantity, 1e-9)
+}
+
+func (s *AutoTraderTestSuite) TestExecuteOpenLongAutoCloseFailsWithoutPositions() {
+	s.patches.ApplyFunc(market.Get, func(symbol string) (*market.Data, error) {
+		return &market.Data{Symbol: symbol, CurrentPrice: 1000.0}, nil
+	})
+
+	s.mockTrader.balance["availableBalance"] = 0.5
+	s.mockTrader.openLongErrors = []error{
+		fmt.Errorf("开仓数量过小，格式化后为 0 (原始: 0.00263111 → 格式化: 0.00)"),
+	}
+
+	decision := &decision.Decision{
+		Action:          "open_long",
+		Symbol:          "BTCUSDT",
+		PositionSizeUSD: 1000.0,
+		Leverage:        5,
+		StopLoss:        950.0,
+		TakeProfit:      1050.0,
+	}
+	actionRecord := &logger.DecisionAction{Action: "open_long", Symbol: "BTCUSDT"}
+
+	err := s.autoTrader.executeOpenLongWithRecord(decision, actionRecord)
+
+	s.Error(err)
+	s.Contains(err.Error(), "盈利的持仓")
+	s.Equal(1, s.mockTrader.openLongCallCount)
+	s.Equal(0, s.mockTrader.closeShortCallCount)
+}
+
+func (s *AutoTraderTestSuite) TestExecuteOpenShortAutoCloseWhenSizeTooSmall() {
+	s.patches.ApplyFunc(market.Get, func(symbol string) (*market.Data, error) {
+		return &market.Data{Symbol: symbol, CurrentPrice: 200.0}, nil
+	})
+
+	s.mockTrader.balance["availableBalance"] = 1.0
+	s.mockTrader.positions = []map[string]interface{}{
+		{"symbol": "BTCUSDT", "side": "long", "positionAmt": 1.0, "entryPrice": 90000.0, "markPrice": 92000.0},
+	}
+	s.autoTrader.positionFirstSeenTime["BTCUSDT_long"] = time.Now().Add(-2 * time.Hour).UnixMilli()
+	s.mockTrader.openShortErrors = []error{
+		fmt.Errorf("订单金额 91.25 USDT 低于最小要求 100.00 USDT (数量: 0.0010, 价格: 91249.9000)"),
+		nil,
+	}
+	s.mockTrader.onCloseLong = func() {
+		s.mockTrader.balance["availableBalance"] = 4000.0
+		s.mockTrader.positions = []map[string]interface{}{}
+	}
+
+	decision := &decision.Decision{
+		Action:          "open_short",
+		Symbol:          "ETHUSDT",
+		PositionSizeUSD: 800.0,
+		Leverage:        5,
+		StopLoss:        220.0,
+		TakeProfit:      180.0,
+	}
+	actionRecord := &logger.DecisionAction{Action: "open_short", Symbol: "ETHUSDT"}
+
+	err := s.autoTrader.executeOpenShortWithRecord(decision, actionRecord)
+
+	s.NoError(err)
+	s.Equal(int64(123457), actionRecord.OrderID)
+	s.Equal(2, s.mockTrader.openShortCallCount)
+	s.Equal(1, s.mockTrader.closeLongCallCount)
+	s.InEpsilon(4.0, actionRecord.Quantity, 1e-9)
+}
+
+func (s *AutoTraderTestSuite) TestExecuteOpenLongAutoCloseSkipsLosingPositions() {
+	s.patches.ApplyFunc(market.Get, func(symbol string) (*market.Data, error) {
+		return &market.Data{Symbol: symbol, CurrentPrice: 1000.0}, nil
+	})
+
+	s.mockTrader.balance["availableBalance"] = 0.5
+	s.mockTrader.positions = []map[string]interface{}{
+		{"symbol": "BTCUSDT", "side": "long", "positionAmt": 0.5, "entryPrice": 1100.0, "markPrice": 1000.0},
+	}
+	s.autoTrader.positionFirstSeenTime["BTCUSDT_long"] = time.Now().Add(-time.Hour).UnixMilli()
+	s.mockTrader.openLongErrors = []error{
+		fmt.Errorf("订单金额 5.00 USDT 低于最小要求 10.00 USDT"),
+	}
+
+	decision := &decision.Decision{
+		Action:          "open_long",
+		Symbol:          "ETHUSDT",
+		PositionSizeUSD: 1000.0,
+		Leverage:        5,
+		StopLoss:        950.0,
+		TakeProfit:      1050.0,
+	}
+	actionRecord := &logger.DecisionAction{Action: "open_long", Symbol: "ETHUSDT"}
+
+	err := s.autoTrader.executeOpenLongWithRecord(decision, actionRecord)
+
+	s.Error(err)
+	s.Contains(err.Error(), "盈利的持仓")
+	s.Equal(0, s.mockTrader.closeLongCallCount)
+	s.mockTrader.openLongErrors = nil
+}
+
+func (s *AutoTraderTestSuite) TestExecuteOpenLongAutoCloseSkipsIfStillInsufficient() {
+	s.patches.ApplyFunc(market.Get, func(symbol string) (*market.Data, error) {
+		return &market.Data{Symbol: symbol, CurrentPrice: 1000.0}, nil
+	})
+
+	s.mockTrader.balance["availableBalance"] = 5.0
+	s.mockTrader.positions = []map[string]interface{}{
+		{"symbol": "ETHUSDT", "side": "short", "positionAmt": -0.05, "entryPrice": 1005.0, "markPrice": 995.0, "leverage": 10.0},
+	}
+	s.autoTrader.positionFirstSeenTime["ETHUSDT_short"] = time.Now().Add(-30 * time.Minute).UnixMilli()
+	s.mockTrader.openLongErrors = []error{
+		fmt.Errorf("订单金额 5.00 USDT 低于最小要求 10.00 USDT"),
+	}
+
+	decision := &decision.Decision{
+		Action:          "open_long",
+		Symbol:          "BTCUSDT",
+		PositionSizeUSD: 1000.0,
+		Leverage:        5,
+		StopLoss:        950.0,
+		TakeProfit:      1050.0,
+	}
+	actionRecord := &logger.DecisionAction{Action: "open_long", Symbol: "BTCUSDT"}
+
+	err := s.autoTrader.executeOpenLongWithRecord(decision, actionRecord)
+
+	s.Error(err)
+	s.Contains(err.Error(), "无法满足保证金要求")
+	s.Equal(0, s.mockTrader.closeShortCallCount)
+	s.mockTrader.openLongErrors = nil
+}
+
 // TestExecuteClosePosition 测试平仓操作（多空通用）
 func (s *AutoTraderTestSuite) TestExecuteClosePosition() {
 	tests := []struct {
-		name          string
-		action        string
-		currentPrice  float64
-		expectedOrder int64
-		executeFn     func(*decision.Decision, *logger.DecisionAction) error
+		name             string
+		action           string
+		currentPrice     float64
+		expectedOrder    int64
+		expectNoPosition bool
+		setup            func()
+		executeFn        func(*decision.Decision, *logger.DecisionAction) error
 	}{
 		{
 			name:          "成功平多仓",
 			action:        "close_long",
 			currentPrice:  51000.0,
 			expectedOrder: 123458,
+			setup:         nil,
 			executeFn: func(d *decision.Decision, a *logger.DecisionAction) error {
 				return s.autoTrader.executeCloseLongWithRecord(d, a)
 			},
@@ -628,6 +799,31 @@ func (s *AutoTraderTestSuite) TestExecuteClosePosition() {
 			action:        "close_short",
 			currentPrice:  49000.0,
 			expectedOrder: 123459,
+			setup:         nil,
+			executeFn: func(d *decision.Decision, a *logger.DecisionAction) error {
+				return s.autoTrader.executeCloseShortWithRecord(d, a)
+			},
+		},
+		{
+			name:             "平多仓_无持仓自动忽略",
+			action:           "close_long",
+			currentPrice:     50500.0,
+			expectNoPosition: true,
+			setup: func() {
+				s.mockTrader.closeLongErrors = []error{fmt.Errorf("没有找到 BTCUSDT 的多仓")}
+			},
+			executeFn: func(d *decision.Decision, a *logger.DecisionAction) error {
+				return s.autoTrader.executeCloseLongWithRecord(d, a)
+			},
+		},
+		{
+			name:             "平空仓_无持仓自动忽略",
+			action:           "close_short",
+			currentPrice:     49500.0,
+			expectNoPosition: true,
+			setup: func() {
+				s.mockTrader.closeShortErrors = []error{fmt.Errorf("没有找到 BTCUSDT 的空仓")}
+			},
 			executeFn: func(d *decision.Decision, a *logger.DecisionAction) error {
 				return s.autoTrader.executeCloseShortWithRecord(d, a)
 			},
@@ -637,6 +833,9 @@ func (s *AutoTraderTestSuite) TestExecuteClosePosition() {
 	for _, tt := range tests {
 		time.Sleep(time.Millisecond)
 		s.Run(tt.name, func() {
+			if tt.setup != nil {
+				tt.setup()
+			}
 			s.patches.ApplyFunc(market.Get, func(symbol string) (*market.Data, error) {
 				return &market.Data{Symbol: symbol, CurrentPrice: tt.currentPrice}, nil
 			})
@@ -647,8 +846,15 @@ func (s *AutoTraderTestSuite) TestExecuteClosePosition() {
 			err := tt.executeFn(decision, actionRecord)
 
 			s.NoError(err)
-			s.Equal(tt.expectedOrder, actionRecord.OrderID)
+			if tt.expectNoPosition {
+				s.Equal(int64(0), actionRecord.OrderID)
+			} else {
+				s.Equal(tt.expectedOrder, actionRecord.OrderID)
+			}
 			s.Equal(tt.currentPrice, actionRecord.Price)
+
+			s.mockTrader.closeLongErrors = nil
+			s.mockTrader.closeShortErrors = nil
 		})
 	}
 }
@@ -666,15 +872,17 @@ func (s *AutoTraderTestSuite) TestExecuteUpdateStopOrTakeProfit() {
 	})
 
 	tests := []struct {
-		name         string
-		action       string
-		symbol       string
-		side         string
-		currentPrice float64
-		newPrice     float64
-		hasPosition  bool
-		expectedErr  string
-		executeFn    func(*decision.Decision, *logger.DecisionAction) error
+		name             string
+		action           string
+		symbol           string
+		side             string
+		currentPrice     float64
+		newPrice         float64
+		hasPosition      bool
+		expectedErr      string
+		expectCloseLong  bool
+		expectCloseShort bool
+		executeFn        func(*decision.Decision, *logger.DecisionAction) error
 	}{
 		{
 			name:         "成功更新多头止损",
@@ -725,14 +933,14 @@ func (s *AutoTraderTestSuite) TestExecuteUpdateStopOrTakeProfit() {
 			},
 		},
 		{
-			name:         "多头止损价格不合理",
-			action:       "update_stop_loss",
-			symbol:       "BTCUSDT",
-			side:         "long",
-			currentPrice: 50000.0,
-			newPrice:     51000.0,
-			hasPosition:  true,
-			expectedErr:  "多单止损价异常偏高",
+			name:            "多头止损价格不合理",
+			action:          "update_stop_loss",
+			symbol:          "BTCUSDT",
+			side:            "long",
+			currentPrice:    50000.0,
+			newPrice:        51000.0,
+			hasPosition:     true,
+			expectCloseLong: true,
 			executeFn: func(d *decision.Decision, a *logger.DecisionAction) error {
 				return s.autoTrader.executeUpdateStopLossWithRecord(d, a)
 			},
@@ -781,6 +989,8 @@ func (s *AutoTraderTestSuite) TestExecuteUpdateStopOrTakeProfit() {
 		s.Run(tt.name, func() {
 			// 设置当前测试用例的价格
 			testPrice = &tt.currentPrice
+			prevCloseLong := s.mockTrader.closeLongCallCount
+			prevCloseShort := s.mockTrader.closeShortCallCount
 
 			if tt.hasPosition {
 				s.mockTrader.positions = []map[string]interface{}{
@@ -806,6 +1016,15 @@ func (s *AutoTraderTestSuite) TestExecuteUpdateStopOrTakeProfit() {
 			} else {
 				s.NoError(err)
 				s.Equal(tt.currentPrice, actionRecord.Price)
+			}
+
+			if tt.expectCloseLong {
+				s.Greater(s.mockTrader.closeLongCallCount, prevCloseLong)
+				s.Equal("close_long", actionRecord.Action)
+			}
+			if tt.expectCloseShort {
+				s.Greater(s.mockTrader.closeShortCallCount, prevCloseShort)
+				s.Equal("close_short", actionRecord.Action)
 			}
 
 			// 恢复默认状态
@@ -1081,6 +1300,16 @@ type MockTrader struct {
 	shouldFailOpenLong   bool
 	shouldFailCloseLong  bool
 	shouldFailCloseShort bool
+	openLongErrors       []error
+	openShortErrors      []error
+	openLongCallCount    int
+	openShortCallCount   int
+	closeLongCallCount   int
+	closeShortCallCount  int
+	closeLongErrors      []error
+	closeShortErrors     []error
+	onCloseLong          func()
+	onCloseShort         func()
 }
 
 func (m *MockTrader) GetBalance() (map[string]interface{}, error) {
@@ -1108,6 +1337,14 @@ func (m *MockTrader) GetPositions() ([]map[string]interface{}, error) {
 }
 
 func (m *MockTrader) OpenLong(symbol string, quantity float64, leverage int) (map[string]interface{}, error) {
+	m.openLongCallCount++
+	if len(m.openLongErrors) > 0 {
+		err := m.openLongErrors[0]
+		m.openLongErrors = m.openLongErrors[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
 	if m.shouldFailOpenLong {
 		return nil, errors.New("failed to open long")
 	}
@@ -1118,6 +1355,14 @@ func (m *MockTrader) OpenLong(symbol string, quantity float64, leverage int) (ma
 }
 
 func (m *MockTrader) OpenShort(symbol string, quantity float64, leverage int) (map[string]interface{}, error) {
+	m.openShortCallCount++
+	if len(m.openShortErrors) > 0 {
+		err := m.openShortErrors[0]
+		m.openShortErrors = m.openShortErrors[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
 	return map[string]interface{}{
 		"orderId": int64(123457),
 		"symbol":  symbol,
@@ -1125,6 +1370,17 @@ func (m *MockTrader) OpenShort(symbol string, quantity float64, leverage int) (m
 }
 
 func (m *MockTrader) CloseLong(symbol string, quantity float64) (map[string]interface{}, error) {
+	m.closeLongCallCount++
+	if len(m.closeLongErrors) > 0 {
+		err := m.closeLongErrors[0]
+		m.closeLongErrors = m.closeLongErrors[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
+	if m.onCloseLong != nil {
+		m.onCloseLong()
+	}
 	if m.shouldFailCloseLong {
 		return nil, errors.New("failed to close long")
 	}
@@ -1135,6 +1391,17 @@ func (m *MockTrader) CloseLong(symbol string, quantity float64) (map[string]inte
 }
 
 func (m *MockTrader) CloseShort(symbol string, quantity float64) (map[string]interface{}, error) {
+	m.closeShortCallCount++
+	if len(m.closeShortErrors) > 0 {
+		err := m.closeShortErrors[0]
+		m.closeShortErrors = m.closeShortErrors[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
+	if m.onCloseShort != nil {
+		m.onCloseShort()
+	}
 	if m.shouldFailCloseShort {
 		return nil, errors.New("failed to close short")
 	}
